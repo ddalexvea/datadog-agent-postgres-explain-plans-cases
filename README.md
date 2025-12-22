@@ -340,6 +340,34 @@ data:
         conn.close()
         return jsonify({"executed_queries": len(queries), "results": results})
 
+    @app.route('/restricted')
+    def get_restricted():
+        """
+        Query restricted_schema.secret_table using psycopg3 (extended query protocol).
+        This generates parameterized queries with $1 placeholders.
+        Used to reproduce 'failed_to_explain_with_prepared_statement' error.
+        """
+        import random
+        try:
+            import psycopg
+            conn = psycopg.connect(
+                host=os.environ.get('POSTGRES_HOST', 'postgres'),
+                port=int(os.environ.get('POSTGRES_PORT', 5432)),
+                dbname=os.environ.get('POSTGRES_DB', 'demo_app'),
+                user=os.environ.get('POSTGRES_USER', 'postgres'),
+                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
+            )
+            cur = conn.cursor()
+            # Parameterized query - will have $1 placeholder in pg_stat_statements
+            random_id = random.randint(1, 5)
+            cur.execute("SELECT * FROM restricted_schema.secret_table WHERE id = %s", (random_id,))
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return jsonify({"restricted_data": [{"id": r[0], "data": r[1]} for r in rows]})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     if __name__ == '__main__':
         print("Starting demo app on port 8080...")
         app.run(host='0.0.0.0', port=8080)
@@ -375,7 +403,7 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              pip install --quiet psycopg2-binary flask
+              pip install --quiet psycopg2-binary 'psycopg[binary]' flask
               echo "Waiting for PostgreSQL..."
               sleep 5
               python /app/main.py
@@ -477,35 +505,6 @@ kubectl get pods -n datadog
 kubectl exec -n datadog $(kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}') -- agent status | grep -A 10 "postgres"
 ```
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        postgres-demo namespace                   │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────┐         ┌──────────────────────────────────┐  │
-│  │  demo-app    │────────▶│         PostgreSQL 15            │  │
-│  │  (traffic    │         │  ┌────────────────────────────┐  │  │
-│  │   generator) │         │  │ demo_app database          │  │  │
-│  └──────────────┘         │  │  - users table             │  │  │
-│                           │  │  - orders table            │  │  │
-│                           │  │  - datadog schema          │  │  │
-│                           │  │  - restricted_schema       │  │  │
-│                           │  └────────────────────────────┘  │  │
-│                           └──────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                      ▲
-                                      │ Autodiscovery
-┌─────────────────────────────────────┴───────────────────────────┐
-│                         datadog namespace                        │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Datadog Agent                          │   │
-│  │  - DBM enabled via annotations (dbm: true)               │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
 ## DBM Configuration
 
 The PostgreSQL integration is configured via Kubernetes annotations:
@@ -573,13 +572,13 @@ Expected output: A JSON explain plan showing the query execution details.
 kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
 sleep 2
 
-# Generate traffic every 0.1 sec
-for i in {1..100}; do
+# Generate traffic for 60 seconds (every 0.5 sec)
+for i in {1..120}; do
   curl -s http://localhost:8080/generate-traffic > /dev/null &
   curl -s http://localhost:8080/users > /dev/null &
   curl -s http://localhost:8080/orders > /dev/null &
   curl -s http://localhost:8080/orders/stats > /dev/null &
-  sleep 0.1
+  sleep 0.5
 done
 
 pkill -f "port-forward.*8080"
@@ -604,11 +603,11 @@ echo "Traffic generated - check DBM UI for explain plans"
 
 ### 1. ❌ Undefined Explain Function
 
-**Error Code:** `undefined-explain-function`
+**Error Code:** `undefined_function` / `undefined-explain-function`
 
 **UI Message:**
-> Missing function in the datadog schema
-> The required **explain_statement** function might be missing in the datadog schema.
+> Unable to collect explain plan due to an undefined function error
+> The explain plan could not be collected because the query contains a function with a parameter whose datatype could not be determined.
 
 **How to Reproduce:**
 
@@ -622,12 +621,12 @@ DROP FUNCTION IF EXISTS datadog.explain_statement(TEXT);
 kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
 sleep 2
 
-# Generate traffic every 0.1 sec
-for i in {1..100}; do
+# Generate traffic for 60 seconds (every 0.5 sec)
+for i in {1..120}; do
   curl -s http://localhost:8080/generate-traffic > /dev/null &
   curl -s http://localhost:8080/users > /dev/null &
   curl -s http://localhost:8080/orders > /dev/null &
-  sleep 0.1
+  sleep 0.5
 done
 
 pkill -f "port-forward.*8080"
@@ -695,8 +694,78 @@ END;
 LANGUAGE 'plpgsql'
 RETURNS NULL ON NULL INPUT;
 
--- Revoke execute permission
+-- Revoke execute permission from PUBLIC and datadog
+REVOKE EXECUTE ON FUNCTION datadog.explain_statement(TEXT) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION datadog.explain_statement(TEXT) FROM datadog;
+"
+
+# Generate traffic for 60 seconds (every 0.5 sec)
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+sleep 2
+
+for i in {1..120}; do
+  curl -s http://localhost:8080/generate-traffic > /dev/null &
+  curl -s http://localhost:8080/users > /dev/null &
+  curl -s http://localhost:8080/orders > /dev/null &
+  sleep 0.5
+done
+
+pkill -f "port-forward.*8080"
+```
+
+**Fix:**
+
+Recreate the function with `SECURITY DEFINER` and grant execute permission:
+
+```sql
+CREATE OR REPLACE FUNCTION datadog.explain_statement(
+   l_query TEXT,
+   OUT explain JSON
+)
+RETURNS SETOF JSON AS
+$$
+DECLARE
+curs REFCURSOR;
+plan JSON;
+BEGIN
+   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
+   FETCH curs INTO plan;
+   CLOSE curs;
+   RETURN QUERY SELECT plan;
+END;
+$$
+LANGUAGE 'plpgsql'
+RETURNS NULL ON NULL INPUT
+SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
+```
+
+Or run:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+CREATE OR REPLACE FUNCTION datadog.explain_statement(
+   l_query TEXT,
+   OUT explain JSON
+)
+RETURNS SETOF JSON AS
+\\\$\\\$
+DECLARE
+curs REFCURSOR;
+plan JSON;
+BEGIN
+   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
+   FETCH curs INTO plan;
+   CLOSE curs;
+   RETURN QUERY SELECT plan;
+END;
+\\\$\\\$
+LANGUAGE 'plpgsql'
+RETURNS NULL ON NULL INPUT
+SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 "
 ```
 
@@ -708,27 +777,13 @@ REVOKE EXECUTE ON FUNCTION datadog.explain_statement(TEXT) FROM datadog;
 
 **UI Message:**
 > The Datadog agent user lacks permission to execute the parameterized query
-> Execution of the EXPLAIN command failed because the datadog user does not have sufficient permissions to explain the specified query on the target table.
+> Execution of the EXPLAIN command failed because the datadog user does not have sufficient permissions to explain the specified query on the target table. Please ensure the user has the necessary permissions on the table involved in the query. Granting the necessary COMMAND permission on the relevant table(s) using the GRANT SQL command should resolve this issue.
 
 **How to Reproduce:**
 
 ```bash
-# Create a restricted schema that datadog cannot access
+# Step 1: Ensure explain function exists with SECURITY DEFINER
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
--- Create restricted schema
-CREATE SCHEMA IF NOT EXISTS restricted_schema;
-REVOKE ALL ON SCHEMA restricted_schema FROM datadog;
-REVOKE ALL ON SCHEMA restricted_schema FROM PUBLIC;
-
--- Create a table in that schema
-CREATE TABLE IF NOT EXISTS restricted_schema.secret_table (
-    id SERIAL PRIMARY KEY,
-    data TEXT
-);
-INSERT INTO restricted_schema.secret_table (data) VALUES ('secret1'), ('secret2'), ('secret3')
-ON CONFLICT DO NOTHING;
-
--- Ensure explain function exists with SECURITY DEFINER
 CREATE OR REPLACE FUNCTION datadog.explain_statement(
    l_query TEXT,
    OUT explain JSON
@@ -752,28 +807,65 @@ SECURITY DEFINER;
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 "
 
-# Generate parameterized queries using psycopg3 (extended query protocol)
-kubectl exec -n postgres-demo deployment/demo-app -- pip install 'psycopg[binary]' -q
+# Step 2: Create a restricted schema that datadog cannot access
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+CREATE SCHEMA IF NOT EXISTS restricted_schema;
+REVOKE ALL ON SCHEMA restricted_schema FROM datadog;
+REVOKE ALL ON SCHEMA restricted_schema FROM PUBLIC;
 
-kubectl exec -n postgres-demo deployment/demo-app -- python3 -c "
-import psycopg
-conn = psycopg.connect(host='postgres', port=5432, dbname='demo_app', user='postgres', password='datadog123')
-cur = conn.cursor()
-# These queries will have \$1 placeholders - agent will try PREPARE as datadog user
-for i in range(30):
-    cur.execute('SELECT * FROM restricted_schema.secret_table WHERE id = %s', (i % 3 + 1,))
-cur.close()
-conn.close()
-print('Queries executed - agent will fail to PREPARE these')
+DROP TABLE IF EXISTS restricted_schema.secret_table;
+CREATE TABLE restricted_schema.secret_table (
+    id SERIAL PRIMARY KEY,
+    data TEXT
+);
+INSERT INTO restricted_schema.secret_table (data) VALUES ('secret1'), ('secret2'), ('secret3'), ('secret4'), ('secret5');
 "
+
+# Step 3: Generate traffic via curl to /restricted endpoint (uses psycopg3 extended query protocol)
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+sleep 2
+
+# Generate traffic for 60 seconds (every 0.5 sec)
+for i in {1..120}; do
+  curl -s http://localhost:8080/users > /dev/null &
+  curl -s http://localhost:8080/orders > /dev/null &
+  curl -s http://localhost:8080/restricted > /dev/null &
+  sleep 0.5
+done
+
+pkill -f "port-forward.*8080"
 ```
 
 **Why it works:**
-1. App runs `SELECT * FROM restricted_schema.secret_table WHERE id = $1`
-2. Agent sees query in `pg_stat_statements` with `$1` placeholder
-3. Agent tries to PREPARE: `PREPARE dd_xxx AS SELECT * FROM restricted_schema.secret_table WHERE id = $1`
-4. PREPARE fails: `permission denied for schema restricted_schema`
-5. Agent emits `failed_to_explain_with_prepared_statement`
+1. Demo-app `/restricted` endpoint uses **psycopg3** (extended query protocol)
+2. App runs `SELECT * FROM restricted_schema.secret_table WHERE id = $1`
+3. Agent sees query in `pg_stat_statements` with `$1` placeholder
+4. Agent tries to PREPARE: `PREPARE dd_xxx AS SELECT * FROM restricted_schema.secret_table WHERE id = $1`
+5. PREPARE fails: `permission denied for schema restricted_schema`
+6. Agent emits `failed_to_explain_with_prepared_statement`
+
+> **Note:** The `/restricted` endpoint uses `psycopg` (psycopg3) instead of `psycopg2` because psycopg3 uses the extended query protocol which sends parameterized queries with `$1` placeholders.
+
+**Fix:**
+
+Grant the `datadog` user access to the restricted schema and table:
+
+```sql
+-- Grant schema access
+GRANT USAGE ON SCHEMA restricted_schema TO datadog;
+
+-- Grant table access
+GRANT SELECT ON restricted_schema.secret_table TO datadog;
+```
+
+Or run:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+GRANT USAGE ON SCHEMA restricted_schema TO datadog;
+GRANT SELECT ON restricted_schema.secret_table TO datadog;
+"
+```
 
 ---
 
@@ -811,6 +903,19 @@ SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 "
+
+# Generate traffic for 60 seconds (every 0.5 sec)
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+sleep 2
+
+for i in {1..120}; do
+  curl -s http://localhost:8080/generate-traffic > /dev/null &
+  curl -s http://localhost:8080/users > /dev/null &
+  curl -s http://localhost:8080/orders > /dev/null &
+  sleep 0.5
+done
+
+pkill -f "port-forward.*8080"
 ```
 
 ---
@@ -826,23 +931,39 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 **How to Reproduce:**
 
 ```bash
-# Set very low track_activity_query_size
+# Set very low track_activity_query_size and restart PostgreSQL
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -c "
 ALTER SYSTEM SET track_activity_query_size = 100;
-SELECT pg_reload_conf();
 "
+# Restart postgres to apply the setting
+kubectl rollout restart deployment/postgres -n postgres-demo
+kubectl rollout status deployment/postgres -n postgres-demo
 
-# Generate long query
-kubectl exec -n postgres-demo deployment/demo-app -- python3 -c "
+# Wait for postgres to be ready
+sleep 10
+
+# Generate long queries for 60 seconds (every 0.5 sec)
+kubectl exec -n postgres-demo deployment/demo-app -- pip install 'psycopg[binary]' -q
+
+for i in {1..120}; do
+  kubectl exec -n postgres-demo deployment/demo-app -- python3 -c "
 import psycopg
 conn = psycopg.connect(host='postgres', port=5432, dbname='demo_app', user='postgres', password='datadog123')
 cur = conn.cursor()
 # Very long query that will be truncated
-long_condition = ' OR '.join([f'name = %s' for _ in range(50)])
-cur.execute(f'SELECT * FROM users WHERE {long_condition}', tuple(['test'] * 50))
+long_condition = ' OR '.join([f'name = \\'test{j}\\'' for j in range(50)])
+cur.execute(f'SELECT * FROM users WHERE {long_condition}')
 cur.close()
 conn.close()
-"
+" 2>/dev/null &
+  sleep 0.5
+done
+
+echo "Traffic generated - check DBM UI for 'query truncation' error"
+
+# Don't forget to restore track_activity_query_size after testing!
+# kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -c "ALTER SYSTEM RESET track_activity_query_size;"
+# kubectl rollout restart deployment/postgres -n postgres-demo
 ```
 
 ---

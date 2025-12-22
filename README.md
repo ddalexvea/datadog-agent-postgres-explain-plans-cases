@@ -594,8 +594,9 @@ echo "Traffic generated - check DBM UI for explain plans"
 - Each query sample has an **Explain Plan** tab with execution details
 - No error messages on explain plan collection
 
-<!-- Add your screenshot here -->
-<!-- ![Working Explain Plan](./screenshots/working-explain-plan.png) -->
+**Screenshot:**
+
+![Case 0 - Working Explain Plans](./case0.png)
 
 ---
 
@@ -657,6 +658,10 @@ SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ```
+
+**Screenshot:**
+
+![Case 1 - Undefined Function](./case1.png)
 
 ---
 
@@ -769,6 +774,10 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 "
 ```
 
+**Screenshot:**
+
+![Case 2 - Failed Function](./case2.png)
+
 ---
 
 ### 3. ❌ Failed to Explain with Prepared Statement (Lack of Permissions)
@@ -867,9 +876,13 @@ GRANT SELECT ON restricted_schema.secret_table TO datadog;
 "
 ```
 
+**Screenshot:**
+
+![Case 3 - Failed Prepared Statement](./case3.png)
+
 ---
 
-### 4. ❌ Database Error (Configuration Error)
+### 4. ❌ Configuration Error (Generic Database Error)
 
 **Error Code:** `database_error`
 
@@ -877,12 +890,19 @@ GRANT SELECT ON restricted_schema.secret_table TO datadog;
 > Unable to collect explain plan
 > This may be due to a configuration error.
 
+**Description:**
+
+This is a **catch-all error** that appears when the agent encounters an unexpected issue while collecting explain plans. Common causes include:
+- Incorrect function definition
+- Function throws an exception
+- Unexpected database response
+- Connection issues during explain collection
+
 **How to Reproduce:**
 
-This is a catch-all error for various database-level issues. One way to trigger it:
+One way to trigger this error is to create an `explain_statement` function that throws an exception:
 
 ```bash
-# Create function that returns invalid result
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
 DROP FUNCTION IF EXISTS datadog.explain_statement(TEXT);
 
@@ -893,8 +913,8 @@ CREATE OR REPLACE FUNCTION datadog.explain_statement(
 RETURNS SETOF JSON AS
 \$\$
 BEGIN
-   -- Return NULL instead of a valid plan
-   RETURN QUERY SELECT NULL::JSON;
+   -- Throw an exception instead of returning a valid plan
+   RAISE EXCEPTION 'Simulated configuration error';
 END;
 \$\$
 LANGUAGE 'plpgsql'
@@ -918,53 +938,37 @@ done
 pkill -f "port-forward.*8080"
 ```
 
----
+**Fix:**
 
-### 5. ❌ Query Truncated
+Restore the correct `explain_statement` function:
 
-**Error Code:** `query_truncated`
+```sql
+CREATE OR REPLACE FUNCTION datadog.explain_statement(
+   l_query TEXT,
+   OUT explain JSON
+)
+RETURNS SETOF JSON AS
+$$
+DECLARE
+curs REFCURSOR;
+plan JSON;
+BEGIN
+   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
+   FETCH curs INTO plan;
+   CLOSE curs;
+   RETURN QUERY SELECT plan;
+END;
+$$
+LANGUAGE 'plpgsql'
+RETURNS NULL ON NULL INPUT
+SECURITY DEFINER;
 
-**UI Message:**
-> Explain plan unavailable due to query truncation
-> Explain plan was not collected for this query as it exceeded your `track_activity_query_size` limit.
-
-**How to Reproduce:**
-
-```bash
-# Set very low track_activity_query_size and restart PostgreSQL
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -c "
-ALTER SYSTEM SET track_activity_query_size = 100;
-"
-# Restart postgres to apply the setting
-kubectl rollout restart deployment/postgres -n postgres-demo
-kubectl rollout status deployment/postgres -n postgres-demo
-
-# Wait for postgres to be ready
-sleep 10
-
-# Generate long queries for 60 seconds (every 0.5 sec)
-kubectl exec -n postgres-demo deployment/demo-app -- pip install 'psycopg[binary]' -q
-
-for i in {1..120}; do
-  kubectl exec -n postgres-demo deployment/demo-app -- python3 -c "
-import psycopg
-conn = psycopg.connect(host='postgres', port=5432, dbname='demo_app', user='postgres', password='datadog123')
-cur = conn.cursor()
-# Very long query that will be truncated
-long_condition = ' OR '.join([f'name = \\'test{j}\\'' for j in range(50)])
-cur.execute(f'SELECT * FROM users WHERE {long_condition}')
-cur.close()
-conn.close()
-" 2>/dev/null &
-  sleep 0.5
-done
-
-echo "Traffic generated - check DBM UI for 'query truncation' error"
-
-# Don't forget to restore track_activity_query_size after testing!
-# kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -c "ALTER SYSTEM RESET track_activity_query_size;"
-# kubectl rollout restart deployment/postgres -n postgres-demo
+GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ```
+
+**Screenshot:**
+
+![Case 4 - Configuration Error](./case4.png)
 
 ---
 
@@ -1097,11 +1101,3 @@ kubectl delete namespace datadog
    ```bash
    kubectl rollout restart daemonset/datadog-agent -n datadog
    ```
-
-### psycopg module not found
-
-The demo-app pod may have restarted. Reinstall:
-
-```bash
-kubectl exec -n postgres-demo deployment/demo-app -- pip install 'psycopg[binary]' -q
-```

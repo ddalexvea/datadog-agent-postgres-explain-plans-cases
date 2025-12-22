@@ -1101,3 +1101,14 @@ kubectl delete namespace datadog
    ```bash
    kubectl rollout restart daemonset/datadog-agent -n datadog
    ```
+
+---
+
+## References
+
+- [Datadog PostgreSQL Database Monitoring Setup (Self-Hosted)](https://docs.datadoghq.com/database_monitoring/setup_postgres/selfhosted/)
+- [Datadog PostgreSQL Integration](https://docs.datadoghq.com/integrations/postgres/)
+- [Datadog Database Monitoring Troubleshooting](https://docs.datadoghq.com/database_monitoring/troubleshooting/)
+- [Datadog Kubernetes Integration](https://docs.datadoghq.com/containers/kubernetes/)
+- [Datadog Agent Autodiscovery](https://docs.datadoghq.com/containers/kubernetes/integrations/)
+- [DBExplainError Enum (Agent Source Code)](https://github.com/DataDog/integrations-core/blob/master/postgres/datadog_checks/postgres/util.py)

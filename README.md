@@ -104,28 +104,34 @@ data:
     
     CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
-        product VARCHAR(200) NOT NULL,
+        user_id INT REFERENCES users(id),
         amount DECIMAL(10,2) NOT NULL,
-        status VARCHAR(50) DEFAULT 'pending',
+        status VARCHAR(20) DEFAULT 'pending',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
+    -- Create a restricted schema for testing
+    CREATE SCHEMA IF NOT EXISTS restricted_schema;
+    CREATE TABLE restricted_schema.sensitive_data (
+        id SERIAL PRIMARY KEY,
+        data TEXT
+    );
+    -- Note: datadog user does NOT have access to restricted_schema
+    
     -- Insert sample data
-    INSERT INTO users (name, email) VALUES 
-        ('Alice Johnson', 'alice@example.com'),
-        ('Bob Smith', 'bob@example.com'),
-        ('Charlie Brown', 'charlie@example.com');
+    INSERT INTO users (name, email) VALUES
+        ('Alice', 'alice@example.com'),
+        ('Bob', 'bob@example.com'),
+        ('Charlie', 'charlie@example.com');
     
-    INSERT INTO orders (user_id, product, amount, status) VALUES
-        (1, 'Laptop', 999.99, 'completed'),
-        (1, 'Mouse', 29.99, 'completed'),
-        (2, 'Keyboard', 79.99, 'pending'),
-        (3, 'Monitor', 349.99, 'shipped');
+    INSERT INTO orders (user_id, amount, status) VALUES
+        (1, 99.99, 'completed'),
+        (1, 149.99, 'pending'),
+        (2, 29.99, 'completed'),
+        (3, 199.99, 'pending');
     
-    -- Create indexes for query optimization demo
-    CREATE INDEX idx_orders_user_id ON orders(user_id);
-    CREATE INDEX idx_orders_status ON orders(status);
+    -- Grant SELECT on public tables to datadog
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO datadog;
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -136,7 +142,6 @@ metadata:
     app: postgres
     tags.datadoghq.com/env: sandbox
     tags.datadoghq.com/service: postgres-demo
-    tags.datadoghq.com/version: "15"
 spec:
   replicas: 1
   selector:
@@ -148,22 +153,24 @@ spec:
         app: postgres
         tags.datadoghq.com/env: sandbox
         tags.datadoghq.com/service: postgres-demo
-        tags.datadoghq.com/version: "15"
       annotations:
         ad.datadoghq.com/postgres.checks: |
           {
             "postgres": {
+              "init_config": {},
               "instances": [{
-                "dbm": true,
                 "host": "%%host%%",
                 "port": 5432,
                 "username": "datadog",
                 "password": "datadog_password",
-                "dbname": "demo_app"
+                "dbname": "demo_app",
+                "dbm": true,
+                "query_samples": {"enabled": true},
+                "query_metrics": {"enabled": true},
+                "collect_settings": {"enabled": true}
               }]
             }
           }
-        ad.datadoghq.com/postgres.logs: '[{"source":"postgresql","service":"postgres-demo"}]'
     spec:
       containers:
         - name: postgres
@@ -192,27 +199,18 @@ spec:
             - "-c"
             - "pg_stat_statements.track=all"
             - "-c"
-            - "pg_stat_statements.max=10000"
-            - "-c"
             - "track_activity_query_size=4096"
           volumeMounts:
-            - name: postgres-init
-              mountPath: /docker-entrypoint-initdb.d
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "250m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d
       volumes:
+        - name: postgres-data
+          emptyDir: {}
         - name: postgres-init
           configMap:
             name: postgres-init
-        - name: postgres-data
-          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -225,234 +223,6 @@ spec:
   ports:
     - port: 5432
       targetPort: 5432
-  type: ClusterIP
-```
-
-#### app/demo-app.yaml
-
-```yaml
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: demo-app-code
-  namespace: postgres-demo
-data:
-  main.py: |
-    import os
-    import time
-    import psycopg2
-    from flask import Flask, jsonify
-
-    app = Flask(__name__)
-
-    def get_db_connection():
-        return psycopg2.connect(
-            host=os.environ.get('POSTGRES_HOST', 'postgres'),
-            port=os.environ.get('POSTGRES_PORT', 5432),
-            dbname=os.environ.get('POSTGRES_DB', 'demo_app'),
-            user=os.environ.get('POSTGRES_USER', 'postgres'),
-            password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
-        )
-
-    @app.route('/health')
-    def health():
-        return jsonify({"status": "healthy"})
-
-    @app.route('/users')
-    def get_users():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, email, created_at FROM users")
-        users = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"users": [{"id": u[0], "name": u[1], "email": u[2]} for u in users]})
-
-    @app.route('/orders')
-    def get_orders():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT o.id, u.name, o.product, o.amount, o.status, o.created_at
-            FROM orders o
-            JOIN users u ON o.user_id = u.id
-            ORDER BY o.created_at DESC
-        """)
-        orders = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"orders": [
-            {"id": o[0], "user": o[1], "product": o[2], "amount": float(o[3]), "status": o[4]}
-            for o in orders
-        ]})
-
-    @app.route('/orders/stats')
-    def get_order_stats():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 
-                u.name,
-                COUNT(o.id) as order_count,
-                SUM(o.amount) as total_amount,
-                AVG(o.amount) as avg_amount
-            FROM users u
-            LEFT JOIN orders o ON u.id = o.user_id
-            GROUP BY u.id, u.name
-            HAVING COUNT(o.id) > 0
-            ORDER BY total_amount DESC
-        """)
-        stats = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"stats": [
-            {"user": s[0], "order_count": s[1], "total": float(s[2]), "average": float(s[3])}
-            for s in stats
-        ]})
-
-    @app.route('/slow-query')
-    def slow_query():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT pg_sleep(0.5), * FROM orders WHERE status IN ('pending', 'shipped')")
-        orders = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"message": "Slow query completed", "count": len(orders)})
-
-    @app.route('/generate-traffic')
-    def generate_traffic():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        queries = [
-            "SELECT COUNT(*) FROM users",
-            "SELECT * FROM orders WHERE status = 'completed'",
-            "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name",
-            "SELECT * FROM orders WHERE amount > 100 ORDER BY amount DESC",
-            "SELECT DISTINCT status FROM orders",
-        ]
-        results = []
-        for q in queries:
-            cur.execute(q)
-            results.append({"query": q[:50] + "...", "rows": cur.rowcount})
-        cur.close()
-        conn.close()
-        return jsonify({"executed_queries": len(queries), "results": results})
-
-    @app.route('/restricted')
-    def get_restricted():
-        """
-        Query restricted_schema.secret_table using psycopg3 (extended query protocol).
-        This generates parameterized queries with $1 placeholders.
-        Used to reproduce 'failed_to_explain_with_prepared_statement' error.
-        """
-        import random
-        try:
-            import psycopg
-            conn = psycopg.connect(
-                host=os.environ.get('POSTGRES_HOST', 'postgres'),
-                port=int(os.environ.get('POSTGRES_PORT', 5432)),
-                dbname=os.environ.get('POSTGRES_DB', 'demo_app'),
-                user=os.environ.get('POSTGRES_USER', 'postgres'),
-                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
-            )
-            cur = conn.cursor()
-            # Parameterized query - will have $1 placeholder in pg_stat_statements
-            random_id = random.randint(1, 5)
-            cur.execute("SELECT * FROM restricted_schema.secret_table WHERE id = %s", (random_id,))
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-            return jsonify({"restricted_data": [{"id": r[0], "data": r[1]} for r in rows]})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    if __name__ == '__main__':
-        print("Starting demo app on port 8080...")
-        app.run(host='0.0.0.0', port=8080)
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: demo-app
-  namespace: postgres-demo
-  labels:
-    app: demo-app
-    tags.datadoghq.com/env: sandbox
-    tags.datadoghq.com/service: demo-app
-    tags.datadoghq.com/version: "1.0"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: demo-app
-  template:
-    metadata:
-      labels:
-        app: demo-app
-        tags.datadoghq.com/env: sandbox
-        tags.datadoghq.com/service: demo-app
-        tags.datadoghq.com/version: "1.0"
-      annotations:
-        ad.datadoghq.com/demo-app.logs: '[{"source":"python","service":"demo-app"}]'
-    spec:
-      containers:
-        - name: demo-app
-          image: python:3.11-slim
-          command: ["/bin/bash", "-c"]
-          args:
-            - |
-              pip install --quiet psycopg2-binary 'psycopg[binary]' flask
-              echo "Waiting for PostgreSQL..."
-              sleep 5
-              python /app/main.py
-          ports:
-            - containerPort: 8080
-          env:
-            - name: POSTGRES_HOST
-              value: "postgres"
-            - name: POSTGRES_PORT
-              value: "5432"
-            - name: POSTGRES_DB
-              value: "demo_app"
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secrets
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secrets
-                  key: POSTGRES_PASSWORD
-          volumeMounts:
-            - name: app-code
-              mountPath: /app
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "200m"
-      volumes:
-        - name: app-code
-          configMap:
-            name: demo-app-code
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: demo-app
-  namespace: postgres-demo
-spec:
-  selector:
-    app: demo-app
-  ports:
-    - port: 8080
-      targetPort: 8080
-  type: ClusterIP
 ```
 
 #### datadog/values.yaml
@@ -461,12 +231,9 @@ spec:
 datadog:
   site: "datadoghq.com"
   apiKeyExistingSecret: "datadog-secret"
-  clusterName: "postgres-lab"
+  clusterName: "postgres-dbm-sandbox"
   kubelet:
     tlsVerify: false
-  logs:
-    enabled: true
-    containerCollectAll: true
 
 clusterAgent:
   enabled: true
@@ -475,88 +242,57 @@ agents:
   enabled: true
 ```
 
-### Step 3: Deploy everything
+### Step 3: Deploy
 
 ```bash
-# Create directory structure
-mkdir -p postgres app datadog
-
-# Apply manifests
+# Deploy PostgreSQL
 kubectl apply -f postgres/postgres-deployment.yaml
-kubectl apply -f app/demo-app.yaml
 
-# Create Datadog secret (replace with your API key)
-kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
+# Wait for PostgreSQL to be ready
+kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 
 # Deploy Datadog Agent
-helm repo add datadog https://helm.datadoghq.com
-helm repo update
-helm install datadog-agent datadog/datadog -n datadog --create-namespace -f datadog/values.yaml
+kubectl create namespace datadog
+kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
+helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
 ```
-
-### Step 4: Verify deployment
-
-```bash
-# Check pods are running
-kubectl get pods -n postgres-demo
-kubectl get pods -n datadog
-
-# Check Datadog Agent postgres integration
-kubectl exec -n datadog $(kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}') -- agent status | grep -A 10 "postgres"
-```
-
-## DBM Configuration
-
-The PostgreSQL integration is configured via Kubernetes annotations:
-
-```yaml
-ad.datadoghq.com/postgres.checks: |
-  {
-    "postgres": {
-      "instances": [{
-        "dbm": true,
-        "host": "%%host%%",
-        "port": 5432,
-        "username": "datadog",
-        "password": "datadog_password",
-        "dbname": "demo_app"
-      }]
-    }
-  }
-```
-
-> **Note:** `dbm: true` automatically enables query samples, query metrics, and `explain_parameterized_queries`.
 
 ---
 
-## Test Cases
+## Case 0: Working State (Baseline)
 
-### 0. ✅ Working Explain Plans (Baseline)
+This is the expected working state where explain plans are collected successfully.
 
-**Expected Behavior:** Explain plans are collected successfully for all queries.
-
-**Prerequisites:**
-- `datadog.explain_statement` function exists with `SECURITY DEFINER`
-- `datadog` user has `EXECUTE` permission on the function
-- `datadog` user has `pg_monitor` role
-
-#### Step 1: Verify explain function exists
+**Verification:**
 
 ```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-SELECT routine_name FROM information_schema.routines WHERE routine_schema = 'datadog';
+# Test function as datadog user
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 "
 ```
 
-Expected output:
-```
-   routine_name    
--------------------
- explain_statement
-(1 row)
+**Expected output:** JSON explain plan is returned successfully.
+
+---
+
+## Case 1: Missing Schema / Function (`invalid_schema`)
+
+**UI Message:** "Missing function in the datadog schema"
+
+**Description:**
+
+This error appears when the `datadog.explain_statement` function doesn't exist or the datadog schema is missing.
+
+**How to Reproduce:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+DROP FUNCTION IF EXISTS datadog.explain_statement(TEXT);
+"
 ```
 
-#### Step 2: Test function as datadog user
+**Verify the issue:**
 
 ```bash
 kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
@@ -564,73 +300,10 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 "
 ```
 
-Expected output: A JSON explain plan showing the query execution details.
+**Expected error:**
 
-#### Step 3: Generate traffic via the demo-app API
-
-```bash
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-sleep 2
-
-# Generate traffic for 60 seconds (every 0.5 sec)
-for i in {1..120}; do
-  curl -s http://localhost:8080/generate-traffic > /dev/null &
-  curl -s http://localhost:8080/users > /dev/null &
-  curl -s http://localhost:8080/orders > /dev/null &
-  curl -s http://localhost:8080/orders/stats > /dev/null &
-  sleep 0.5
-done
-
-pkill -f "port-forward.*8080"
-echo "Traffic generated - check DBM UI for explain plans"
 ```
-
-#### Expected Result in Datadog DBM UI
-
-- Query samples appear for queries like:
-  - `SELECT * FROM users`
-  - `SELECT * FROM orders`
-  - `SELECT COUNT(*) FROM users`
-- Each query sample has an **Explain Plan** tab with execution details
-- No error messages on explain plan collection
-
-**Screenshot:**
-
-![Case 0 - Working Explain Plans](./case0.png)
-
----
-
-## Reproduced Error Cases
-
-### 1. ❌ Undefined Explain Function
-
-**Error Code:** `undefined_function` / `undefined-explain-function`
-
-**UI Message:**
-> Unable to collect explain plan due to an undefined function error
-> The explain plan could not be collected because the query contains a function with a parameter whose datatype could not be determined.
-
-**How to Reproduce:**
-
-```bash
-# Drop the explain function
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-DROP FUNCTION IF EXISTS datadog.explain_statement(TEXT);
-"
-
-# Generate traffic via curl
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-sleep 2
-
-# Generate traffic for 60 seconds (every 0.5 sec)
-for i in {1..120}; do
-  curl -s http://localhost:8080/generate-traffic > /dev/null &
-  curl -s http://localhost:8080/users > /dev/null &
-  curl -s http://localhost:8080/orders > /dev/null &
-  sleep 0.5
-done
-
-pkill -f "port-forward.*8080"
+ERROR:  function datadog.explain_statement(unknown) does not exist
 ```
 
 **Fix:**
@@ -659,244 +332,104 @@ SECURITY DEFINER;
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ```
 
-**Screenshot:**
-
-![Case 1 - Undefined Function](./case1.png)
-
 ---
 
-### 2. ❌ Failed Function (Permission Issues)
+## Case 2: Table Not in Search Path (`undefined_table`)
 
-**Error Code:** `failed_function`
+**UI Message:** "The Agent can't find one or more tables"
 
-**UI Message:**
-> Unable to collect explain plan
-> There could be a problem with the function used to collect Explain Plans. This may be because the function is missing, the Agent has insufficient permissions, or an incorrect function definition.
+**Description:**
+
+This error occurs when a query references a table in a schema that's not in the search path, and the table name is not schema-qualified.
 
 **How to Reproduce:**
 
 ```bash
-# Create function WITHOUT SECURITY DEFINER and revoke permissions
+# Create a table in a non-public schema
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-DROP FUNCTION IF EXISTS datadog.explain_statement(TEXT);
-
-CREATE OR REPLACE FUNCTION datadog.explain_statement(
-   l_query TEXT,
-   OUT explain JSON
-)
-RETURNS SETOF JSON AS
-\$\$
-DECLARE
-curs REFCURSOR;
-plan JSON;
-BEGIN
-   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
-   FETCH curs INTO plan;
-   CLOSE curs;
-   RETURN QUERY SELECT plan;
-END;
-\$\$
-LANGUAGE 'plpgsql'
-RETURNS NULL ON NULL INPUT;
-
--- Revoke execute permission from PUBLIC and datadog
-REVOKE EXECUTE ON FUNCTION datadog.explain_statement(TEXT) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION datadog.explain_statement(TEXT) FROM datadog;
+CREATE SCHEMA IF NOT EXISTS custom_schema;
+CREATE TABLE IF NOT EXISTS custom_schema.custom_table (id INT PRIMARY KEY, data TEXT);
+GRANT USAGE ON SCHEMA custom_schema TO datadog;
+GRANT SELECT ON custom_schema.custom_table TO datadog;
 "
+```
 
-# Generate traffic for 60 seconds (every 0.5 sec)
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-sleep 2
+**Verify the issue:**
 
-for i in {1..120}; do
-  curl -s http://localhost:8080/generate-traffic > /dev/null &
-  curl -s http://localhost:8080/users > /dev/null &
-  curl -s http://localhost:8080/orders > /dev/null &
-  sleep 0.5
-done
+```bash
+# Query uses unqualified table name - will fail
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
+"
+```
 
-pkill -f "port-forward.*8080"
+**Expected error:**
+
+```
+ERROR:  relation "custom_table" does not exist
 ```
 
 **Fix:**
 
-Recreate the function with `SECURITY DEFINER` and grant execute permission:
+Use schema-qualified table names in queries, or add the schema to search_path:
 
 ```sql
-CREATE OR REPLACE FUNCTION datadog.explain_statement(
-   l_query TEXT,
-   OUT explain JSON
-)
-RETURNS SETOF JSON AS
-$$
-DECLARE
-curs REFCURSOR;
-plan JSON;
-BEGIN
-   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
-   FETCH curs INTO plan;
-   CLOSE curs;
-   RETURN QUERY SELECT plan;
-END;
-$$
-LANGUAGE 'plpgsql'
-RETURNS NULL ON NULL INPUT
-SECURITY DEFINER;
+-- Option 1: Schema-qualified name works
+SELECT datadog.explain_statement('SELECT * FROM custom_schema.custom_table WHERE id = 1');
 
-GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
+-- Option 2: Add schema to search_path
+ALTER ROLE datadog SET search_path TO public, custom_schema;
 ```
-
-Or run:
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-CREATE OR REPLACE FUNCTION datadog.explain_statement(
-   l_query TEXT,
-   OUT explain JSON
-)
-RETURNS SETOF JSON AS
-\\\$\\\$
-DECLARE
-curs REFCURSOR;
-plan JSON;
-BEGIN
-   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
-   FETCH curs INTO plan;
-   CLOSE curs;
-   RETURN QUERY SELECT plan;
-END;
-\\\$\\\$
-LANGUAGE 'plpgsql'
-RETURNS NULL ON NULL INPUT
-SECURITY DEFINER;
-
-GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
-"
-```
-
-**Screenshot:**
-
-![Case 2 - Failed Function](./case2.png)
 
 ---
 
-### 3. ❌ Failed to Explain with Prepared Statement (Lack of Permissions)
+## Case 3: Query Truncation (`query_truncated`)
 
-**Error Code:** `failed_to_explain_with_prepared_statement`
+**UI Message:** "Explain plan unavailable due to query truncation"
 
-**UI Message:**
-> The Datadog agent user lacks permission to execute the parameterized query
-> Execution of the EXPLAIN command failed because the datadog user does not have sufficient permissions to explain the specified query on the target table. Please ensure the user has the necessary permissions on the table involved in the query. Granting the necessary COMMAND permission on the relevant table(s) using the GRANT SQL command should resolve this issue.
+**Description:**
+
+This error occurs when the query text is truncated because it exceeds the `track_activity_query_size` PostgreSQL setting.
 
 **How to Reproduce:**
 
 ```bash
-# Step 1: Ensure explain function exists with SECURITY DEFINER
+# Set a very small track_activity_query_size
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-CREATE OR REPLACE FUNCTION datadog.explain_statement(
-   l_query TEXT,
-   OUT explain JSON
-)
-RETURNS SETOF JSON AS
-\$\$
-DECLARE
-curs REFCURSOR;
-plan JSON;
-BEGIN
-   OPEN curs FOR EXECUTE pg_catalog.concat('EXPLAIN (FORMAT JSON) ', l_query);
-   FETCH curs INTO plan;
-   CLOSE curs;
-   RETURN QUERY SELECT plan;
-END;
-\$\$
-LANGUAGE 'plpgsql'
-RETURNS NULL ON NULL INPUT
-SECURITY DEFINER;
-
-GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
+ALTER SYSTEM SET track_activity_query_size = 100;
+SELECT pg_reload_conf();
 "
 
-# Step 2: Create a restricted schema that datadog cannot access
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-CREATE SCHEMA IF NOT EXISTS restricted_schema;
-REVOKE ALL ON SCHEMA restricted_schema FROM datadog;
-REVOKE ALL ON SCHEMA restricted_schema FROM PUBLIC;
-
-DROP TABLE IF EXISTS restricted_schema.secret_table;
-CREATE TABLE restricted_schema.secret_table (
-    id SERIAL PRIMARY KEY,
-    data TEXT
-);
-INSERT INTO restricted_schema.secret_table (data) VALUES ('secret1'), ('secret2'), ('secret3'), ('secret4'), ('secret5');
-"
-
-# Step 3: Generate traffic via curl to /restricted endpoint (uses psycopg3 extended query protocol)
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-sleep 2
-
-# Generate traffic for 60 seconds (every 0.5 sec)
-for i in {1..120}; do
-  curl -s http://localhost:8080/users > /dev/null &
-  curl -s http://localhost:8080/orders > /dev/null &
-  curl -s http://localhost:8080/restricted > /dev/null &
-  sleep 0.5
-done
-
-pkill -f "port-forward.*8080"
+# Restart PostgreSQL to apply
+kubectl rollout restart deployment/postgres -n postgres-demo
+kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 ```
 
-**Why it works:**
-1. Demo-app `/restricted` endpoint uses **psycopg3** (extended query protocol)
-2. App runs `SELECT * FROM restricted_schema.secret_table WHERE id = $1`
-3. Agent sees query in `pg_stat_statements` with `$1` placeholder
-4. Agent tries to PREPARE: `PREPARE dd_xxx AS SELECT * FROM restricted_schema.secret_table WHERE id = $1`
-5. PREPARE fails: `permission denied for schema restricted_schema`
-6. Agent emits `failed_to_explain_with_prepared_statement`
+**Verify the issue:**
 
-> **Note:** The `/restricted` endpoint uses `psycopg` (psycopg3) instead of `psycopg2` because psycopg3 uses the extended query protocol which sends parameterized queries with `$1` placeholders.
+Long queries will be truncated and cannot be explained.
 
 **Fix:**
 
-Grant the `datadog` user access to the restricted schema and table:
-
 ```sql
--- Grant schema access
-GRANT USAGE ON SCHEMA restricted_schema TO datadog;
-
--- Grant table access
-GRANT SELECT ON restricted_schema.secret_table TO datadog;
+ALTER SYSTEM SET track_activity_query_size = 4096;  -- or higher
+SELECT pg_reload_conf();
 ```
-
-Or run:
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-GRANT USAGE ON SCHEMA restricted_schema TO datadog;
-GRANT SELECT ON restricted_schema.secret_table TO datadog;
-"
-```
-
-**Screenshot:**
-
-![Case 3 - Failed Prepared Statement](./case3.png)
 
 ---
 
-### 4. ❌ Configuration Error (Generic Database Error)
+## Case 4: Configuration Error (`database_error`)
 
-**Error Code:** `database_error`
-
-**UI Message:**
-> Unable to collect explain plan
-> This may be due to a configuration error.
+**UI Message:** "Unable to collect explain plan (configuration error)"
 
 **Description:**
 
 This is a **catch-all error** that appears when the agent encounters an unexpected issue while collecting explain plans. Common causes include:
-- Incorrect function definition
-- Function throws an exception
-- Unexpected database response
-- Connection issues during explain collection
+
+* Incorrect function definition
+* Function throws an exception
+* Unexpected database response
+* Connection issues during explain collection
 
 **How to Reproduce:**
 
@@ -923,19 +456,20 @@ SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 "
+```
 
-# Generate traffic for 60 seconds (every 0.5 sec)
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-sleep 2
+**Verify the issue:**
 
-for i in {1..120}; do
-  curl -s http://localhost:8080/generate-traffic > /dev/null &
-  curl -s http://localhost:8080/users > /dev/null &
-  curl -s http://localhost:8080/orders > /dev/null &
-  sleep 0.5
-done
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
+"
+```
 
-pkill -f "port-forward.*8080"
+**Expected error:**
+
+```
+ERROR:  Simulated configuration error
 ```
 
 **Fix:**
@@ -966,9 +500,117 @@ SECURITY DEFINER;
 GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ```
 
-**Screenshot:**
+---
 
-![Case 4 - Configuration Error](./case4.png)
+## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
+
+**UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
+
+**Description:**
+
+When a query uses `SELECT ... FOR UPDATE`, PostgreSQL requires the **UPDATE privilege** on the target table to acquire row-level locks. This applies even to `EXPLAIN` because PostgreSQL validates privileges during query planning.
+
+If the Datadog user only has `SELECT` privilege (which is common), explain plans will fail for `SELECT ... FOR UPDATE` queries.
+
+| Query Type | Required Privileges |
+|------------|---------------------|
+| `SELECT * FROM users WHERE id = 1` | SELECT |
+| `SELECT * FROM users WHERE id = 1 FOR UPDATE` | SELECT + **UPDATE** |
+
+**How to Reproduce:**
+
+First, verify that datadog user only has SELECT privilege:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+SELECT privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'datadog'
+  AND table_schema = 'public'
+  AND table_name = 'users'
+ORDER BY privilege_type;
+"
+```
+
+**Expected output:**
+
+```
+ privilege_type 
+----------------
+ SELECT
+(1 row)
+```
+
+**Verify regular SELECT works:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+EXPLAIN (FORMAT JSON)
+SELECT * FROM users WHERE id = 1;
+"
+```
+
+**Expected output:** ✅ Returns JSON explain plan
+
+**Verify SELECT ... FOR UPDATE fails:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+EXPLAIN (FORMAT JSON)
+SELECT * FROM users WHERE id = 1 FOR UPDATE;
+"
+```
+
+**Expected error:**
+
+```
+ERROR:  permission denied for table users
+```
+
+**Fix:**
+
+Grant UPDATE privilege on the table to the Datadog user:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+GRANT UPDATE ON TABLE users TO datadog;
+"
+```
+
+**Verify Fix:**
+
+```bash
+# Check privileges now include UPDATE
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+SELECT privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'datadog'
+  AND table_schema = 'public'
+  AND table_name = 'users'
+ORDER BY privilege_type;
+"
+```
+
+**Expected output after fix:**
+
+```
+ privilege_type 
+----------------
+ SELECT
+ UPDATE
+(2 rows)
+```
+
+**Verify EXPLAIN now works:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+EXPLAIN (FORMAT JSON)
+SELECT * FROM users WHERE id = 1 FOR UPDATE;
+"
+```
+
+**Expected output:** ✅ Returns JSON explain plan with `LockRows` node
 
 ---
 
@@ -1037,7 +679,6 @@ WHERE routine_name = 'explain_statement';
 ## Error Codes Reference
 
 These error codes are defined in the Datadog Agent source code:
-- [`DBExplainError` enum](https://github.com/DataDog/integrations-core/blob/467275409f6a9367f22155a872f949d26f7eca2c/postgres/datadog_checks/postgres/util.py#L46)
 
 | Error Code | UI Message | Cause |
 |------------|------------|-------|
@@ -1047,7 +688,7 @@ These error codes are defined in the Datadog Agent source code:
 | `invalid_result` | - | Value retrieved from EXPLAIN function is invalid |
 | `no_plans_possible` | - | Statement cannot be explained (e.g., AUTOVACUUM) |
 | `failed_function` | Unable to collect explain plan (function problem) | Function exists but has issues (permissions, definition) |
-| `query_truncated` | Explain plan unavailable due to query truncation | Query exceeds `track_activity_query_size` |
+| `query_truncated` | Explain plan unavailable due to query truncation | Query exceeds track_activity_query_size |
 | `connection_error` | - | Connection error, possibly misconfiguration |
 | `parameterized_query` | - | Extended query protocol/prepared statements can't be explained directly |
 | `undefined_table` | The Agent can't find one or more tables | Table not in search path |
@@ -1064,11 +705,10 @@ These error codes are defined in the Datadog Agent source code:
 
 ```bash
 # Delete all resources
-kubectl delete -f app/demo-app.yaml
-kubectl delete -f postgres/postgres-deployment.yaml
-helm uninstall datadog-agent -n datadog
 kubectl delete namespace postgres-demo
 kubectl delete namespace datadog
+helm uninstall datadog-agent -n datadog
+minikube delete
 ```
 
 ---
@@ -1110,5 +750,6 @@ kubectl delete namespace datadog
 - [Datadog PostgreSQL Integration](https://docs.datadoghq.com/integrations/postgres/)
 - [Datadog Database Monitoring Troubleshooting](https://docs.datadoghq.com/database_monitoring/troubleshooting/)
 - [Datadog Kubernetes Integration](https://docs.datadoghq.com/containers/kubernetes/)
-- [Datadog Agent Autodiscovery](https://docs.datadoghq.com/containers/kubernetes/integrations/)
-- [DBExplainError Enum (Agent Source Code)](https://github.com/DataDog/integrations-core/blob/master/postgres/datadog_checks/postgres/util.py)
+- [Datadog Agent Autodiscovery](https://docs.datadoghq.com/containers/docker/integrations/)
+- [DBExplainError Enum (Agent Source Code)](https://github.com/DataDog/datadog-agent/blob/main/pkg/collector/corechecks/database_monitoring/dbm_common/explain_errors.go)
+- [PostgreSQL SELECT ... FOR UPDATE Documentation](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)

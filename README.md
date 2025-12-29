@@ -351,17 +351,12 @@ spec:
               
               @app.route('/generate/schema/<int:count>')
               def generate_queries_schema(count):
-                  """Generate multiple queries WITH schema prefix using PREPARED STATEMENT"""
+                  """Generate multiple queries WITH schema prefix (parameterized)"""
                   conn = get_connection()
                   cur = conn.cursor()
-                  # Create prepared statement
-                  cur.execute("PREPARE cs_users_stmt AS SELECT * FROM cs.users WHERE id = $1")
-                  # Execute prepared statement multiple times
                   for i in range(count):
-                      cur.execute("EXECUTE cs_users_stmt(%s)", ((i % 3) + 1,))
+                      cur.execute("SELECT * FROM cs.users WHERE id = %s", ((i % 3) + 1,))
                       cur.fetchall()
-                  # Deallocate prepared statement
-                  cur.execute("DEALLOCATE cs_users_stmt")
                   cur.close()
                   conn.close()
                   return jsonify({"generated": count})
@@ -463,6 +458,12 @@ curl http://localhost:8080/generate/100
 
 # Generate in bulk
 for i in {1..10}; do curl -s http://localhost:8080/generate/100; done
+
+# Generate with prepared statements (cs.users)
+for i in {1..50}; do curl -s http://localhost:8080/generate/schema/100; done
+
+# Generate continuously for 60 seconds (explain plans are collected every minute)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/schema/50 > /dev/null; done
 ```
 
 Queries will appear in Datadog DBM UI at: https://app.datadoghq.com/databases
@@ -470,6 +471,8 @@ Queries will appear in Datadog DBM UI at: https://app.datadoghq.com/databases
 ---
 
 ## Case 0: Working State (Baseline)
+
+![Case 0 - Working State](case0.png)
 
 This is the expected working state where explain plans are collected successfully.
 
@@ -487,6 +490,8 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 ---
 
 ## Case 1: Missing Schema / Function (`invalid_schema`)
+
+![Case 1 - Missing Function](case1.png)
 
 **UI Message:** "Missing function in the datadog schema"
 
@@ -546,6 +551,8 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 
 ## Case 2: Table Not in Search Path (`undefined_table`)
 
+![Case 2 - Undefined Table](case2.png)
+
 **UI Message:** "The Agent can't find one or more tables"
 
 **Description:**
@@ -595,6 +602,8 @@ ALTER ROLE datadog SET search_path TO public, custom_schema;
 
 ## Case 3: Query Truncation (`query_truncated`)
 
+![Case 3 - Query Truncated](case3.png)
+
 **UI Message:** "Explain plan unavailable due to query truncation"
 
 **Description:**
@@ -629,6 +638,8 @@ SELECT pg_reload_conf();
 ---
 
 ## Case 4: Configuration Error (`database_error`)
+
+![Case 4 - Configuration Error](case4.png)
 
 **UI Message:** "Unable to collect explain plan (configuration error)"
 

@@ -602,8 +602,6 @@ ALTER ROLE datadog SET search_path TO public, custom_schema;
 
 ## Case 3: Query Truncation (`query_truncated`)
 
-![Case 3 - Query Truncated](case3.png)
-
 **UI Message:** "Explain plan unavailable due to query truncation"
 
 **Description:**
@@ -724,7 +722,7 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ---
 
 ## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
-
+![Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege](case5.png)
 **UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
 
 **Description:**

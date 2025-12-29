@@ -264,7 +264,6 @@ spec:
               cat > /app.py << 'EOF'
               from flask import Flask, jsonify
               import psycopg2
-              import os
               
               app = Flask(__name__)
               
@@ -281,90 +280,11 @@ spec:
               def health():
                   return jsonify({"status": "ok"})
               
-              @app.route('/query/users/<int:user_id>')
-              def query_user(user_id):
-                  """Query users table WITHOUT schema prefix - triggers search_path issue"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-                  result = cur.fetchone()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"user": result})
-              
-              @app.route('/query/users')
-              def query_all_users():
-                  """Query all users WITHOUT schema prefix"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM users")
-                  results = cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"users": results})
-              
-              @app.route('/query/custom/<int:item_id>')
-              def query_custom(item_id):
-                  """Query custom_table WITHOUT schema prefix - triggers undefined_table (Case 2)
-                  app_user has search_path=custom_schema, datadog does not"""
-                  conn = get_connection()  # Uses app_user with search_path=custom_schema
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM custom_table WHERE id = %s", (item_id,))
-                  result = cur.fetchone()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"custom": result})
-              
-              @app.route('/generate/custom/<int:count>')
-              def generate_custom_queries(count):
-                  """Generate queries to custom_table - triggers undefined_table (Case 2)
-                  app_user has search_path=custom_schema, datadog does not"""
-                  conn = get_connection()  # Uses app_user with search_path=custom_schema
-                  cur = conn.cursor()
-                  for i in range(count):
-                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
-                      cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"generated": count})
-              
-              @app.route('/query/cs/users/<int:user_id>')
-              def query_user_schema(user_id):
-                  """Query users table WITH schema prefix - works correctly"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM cs.users WHERE id = %s", (user_id,))
-                  result = cur.fetchone()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"user": result})
-              
-              @app.route('/query/cs/users')
-              def query_all_users_schema():
-                  """Query all users WITH schema prefix"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM cs.users")
-                  results = cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"users": results})
-              
-              @app.route('/query/users/<int:user_id>/lock')
-              def query_user_lock(user_id):
-                  """SELECT FOR UPDATE - requires UPDATE privilege"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
-                  result = cur.fetchone()
-                  conn.commit()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"user_locked": result})
-              
               @app.route('/generate/<int:count>')
               def generate_queries(count):
-                  """Generate multiple queries WITHOUT schema prefix"""
+                  """Generate queries to 'users' table WITHOUT schema prefix.
+                  Used for: Case 0, 1, 3, 4, 6
+                  app_user has search_path=cs,public so it finds cs.users"""
                   conn = get_connection()
                   cur = conn.cursor()
                   for i in range(count):
@@ -374,17 +294,32 @@ spec:
                   conn.close()
                   return jsonify({"generated": count})
               
-              @app.route('/generate/schema/<int:count>')
-              def generate_queries_schema(count):
-                  """Generate multiple queries WITH schema prefix (parameterized)"""
+              @app.route('/generate/custom/<int:count>')
+              def generate_custom_queries(count):
+                  """Generate queries to 'custom_table' WITHOUT schema prefix.
+                  Used for: Case 2 (undefined_table)
+                  app_user has search_path=custom_schema,public but datadog does not"""
                   conn = get_connection()
                   cur = conn.cursor()
                   for i in range(count):
-                      cur.execute("SELECT * FROM cs.users WHERE id = %s", ((i % 3) + 1,))
+                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
                       cur.fetchall()
                   cur.close()
                   conn.close()
                   return jsonify({"generated": count})
+              
+              @app.route('/query/users/<int:user_id>/lock')
+              def query_user_lock(user_id):
+                  """SELECT FOR UPDATE - requires UPDATE privilege.
+                  Used for: Case 5"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
+                  result = cur.fetchone()
+                  conn.commit()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"user_locked": result})
               
               if __name__ == '__main__':
                   app.run(host='0.0.0.0', port=8080)
@@ -419,6 +354,15 @@ spec:
       targetPort: 8080
   type: ClusterIP
 ```
+
+**Endpoints Summary:**
+
+| Endpoint | Description | Used for |
+|----------|-------------|----------|
+| `/health` | Health check | - |
+| `/generate/<count>` | Query `users` without schema prefix | Case 0, 1, 3, 4, 6 |
+| `/generate/custom/<count>` | Query `custom_table` without schema prefix | Case 2 |
+| `/query/users/<id>/lock` | SELECT FOR UPDATE | Case 5 |
 
 #### datadog/values.yaml
 

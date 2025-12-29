@@ -351,12 +351,17 @@ spec:
               
               @app.route('/generate/schema/<int:count>')
               def generate_queries_schema(count):
-                  """Generate multiple queries WITH schema prefix"""
+                  """Generate multiple queries WITH schema prefix using PREPARED STATEMENT"""
                   conn = get_connection()
                   cur = conn.cursor()
+                  # Create prepared statement
+                  cur.execute("PREPARE cs_users_stmt AS SELECT * FROM cs.users WHERE id = $1")
+                  # Execute prepared statement multiple times
                   for i in range(count):
-                      cur.execute("SELECT * FROM cs.users WHERE id = %s", ((i % 3) + 1,))
+                      cur.execute("EXECUTE cs_users_stmt(%s)", ((i % 3) + 1,))
                       cur.fetchall()
+                  # Deallocate prepared statement
+                  cur.execute("DEALLOCATE cs_users_stmt")
                   cur.close()
                   conn.close()
                   return jsonify({"generated": count})

@@ -476,15 +476,15 @@ end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:80
 
 ---
 
-## Case 1: Missing Schema / Function (`invalid_schema`)
+## Case 1: Missing `datadog.explain_statement` Function (`undefined_function`)
 
 ![Case 1 - Missing Function](case1.png)
 
-**UI Message:** "Missing function in the datadog schema"
+**UI Message:** "Unable to collect explain plan. There could be a problem with the function used to collect Explain Plans."
 
 **Description:**
 
-This error appears when the `datadog.explain_statement` function doesn't exist or the datadog schema is missing.
+This error appears when the `datadog.explain_statement` function doesn't exist. The Agent tries to use this function first, and when it fails, falls back to using `PREPARE` statements which may also fail.
 
 **How to Reproduce:**
 

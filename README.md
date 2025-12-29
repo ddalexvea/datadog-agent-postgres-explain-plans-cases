@@ -267,7 +267,7 @@ spec:
               
               app = Flask(__name__)
               
-              def get_connection(user='postgres', password='datadog123'):
+              def get_connection(user='app_user', password='app_password'):
                   return psycopg2.connect(
                       host='postgres',
                       port=5432,
@@ -282,6 +282,7 @@ spec:
               
               @app.route('/query/users/<int:user_id>')
               def query_user(user_id):
+                  """Query users table WITHOUT schema prefix - triggers search_path issue"""
                   conn = get_connection()
                   cur = conn.cursor()
                   cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
@@ -292,6 +293,7 @@ spec:
               
               @app.route('/query/users')
               def query_all_users():
+                  """Query all users WITHOUT schema prefix"""
                   conn = get_connection()
                   cur = conn.cursor()
                   cur.execute("SELECT * FROM users")
@@ -300,8 +302,31 @@ spec:
                   conn.close()
                   return jsonify({"users": results})
               
+              @app.route('/query/cs/users/<int:user_id>')
+              def query_user_schema(user_id):
+                  """Query users table WITH schema prefix - works correctly"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM cs.users WHERE id = %s", (user_id,))
+                  result = cur.fetchone()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"user": result})
+              
+              @app.route('/query/cs/users')
+              def query_all_users_schema():
+                  """Query all users WITH schema prefix"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM cs.users")
+                  results = cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"users": results})
+              
               @app.route('/query/users/<int:user_id>/lock')
               def query_user_lock(user_id):
+                  """SELECT FOR UPDATE - requires UPDATE privilege"""
                   conn = get_connection()
                   cur = conn.cursor()
                   cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
@@ -313,10 +338,23 @@ spec:
               
               @app.route('/generate/<int:count>')
               def generate_queries(count):
+                  """Generate multiple queries WITHOUT schema prefix"""
                   conn = get_connection()
                   cur = conn.cursor()
                   for i in range(count):
                       cur.execute("SELECT * FROM users WHERE id = %s", ((i % 3) + 1,))
+                      cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"generated": count})
+              
+              @app.route('/generate/schema/<int:count>')
+              def generate_queries_schema(count):
+                  """Generate multiple queries WITH schema prefix"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  for i in range(count):
+                      cur.execute("SELECT * FROM cs.users WHERE id = %s", ((i % 3) + 1,))
                       cur.fetchall()
                   cur.close()
                   conn.close()
@@ -377,11 +415,46 @@ kubectl apply -f postgres/postgres-deployment.yaml
 # Wait for PostgreSQL to be ready
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 
+# Deploy demo-app
+kubectl apply -f app/demo-app.yaml
+
+# Wait for demo-app to be ready
+kubectl wait --for=condition=ready pod -l app=demo-app -n postgres-demo --timeout=120s
+
 # Deploy Datadog Agent
 kubectl create namespace datadog
 kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
+helm repo add datadog https://helm.datadoghq.com
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
 ```
+
+### Step 4: Generate queries via curl
+
+```bash
+# Port-forward the demo-app
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+
+# Health check
+curl http://localhost:8080/health
+
+# Query single user (parameterized query)
+curl http://localhost:8080/query/users/1
+curl http://localhost:8080/query/users/2
+
+# Query all users
+curl http://localhost:8080/query/users
+
+# SELECT FOR UPDATE (Case 5)
+curl http://localhost:8080/query/users/1/lock
+
+# Generate many queries (for DBM visibility)
+curl http://localhost:8080/generate/100
+
+# Generate in bulk
+for i in {1..10}; do curl -s http://localhost:8080/generate/100; done
+```
+
+Queries will appear in Datadog DBM UI at: https://app.datadoghq.com/databases
 
 ---
 
@@ -737,6 +810,171 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 ```
 
 **Expected output:** ✅ Returns JSON explain plan with `LockRows` node
+
+---
+
+## Case 6: Unable to Explain Parameterised Query - Search Paths (`failed_to_explain_with_prepared_statement`)
+
+**UI Message:** "Datadog agent user lacks permission"
+
+**Collection Error:** `collection_errors:[{"code":"failed_to_explain_with_prepared_statement","message":"<class 'psycopg2.errors.UndefinedTable'>"}]`
+
+**Description:**
+
+When the Datadog agent fails to collect an explain plan for a **parameterized query** (prepared statement), this is usually a result of the customer using search paths.
+
+The search path is PostgreSQL's map for where to look when someone asks for a database object without giving the full address (schema + object). By default, it checks the `public` schema, but applications often use custom schemas.
+
+**The Problem:**
+- Application uses `app_user` with `search_path = cs, public`
+- Application queries: `SELECT * FROM users WHERE id = $1` (no schema prefix)
+- Datadog user has `search_path = "$user", public` (default, doesn't include `cs`)
+- Agent tries to `PREPARE` the query → fails with "relation does not exist"
+- Result: `failed_to_explain_with_prepared_statement`
+
+**Setup:**
+
+First, create the `cs` schema and `app_user` with custom search_path:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+-- Create custom schema
+CREATE SCHEMA IF NOT EXISTS cs;
+
+-- Create app_user with custom search_path
+CREATE USER app_user WITH PASSWORD 'app_password';
+ALTER USER app_user SET search_path TO cs, public;
+GRANT USAGE ON SCHEMA cs TO app_user;
+GRANT USAGE ON SCHEMA cs TO datadog;
+
+-- Create users table in cs schema only
+CREATE TABLE IF NOT EXISTS cs.users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO cs.users (name, email) VALUES ('Alice', 'alice@example.com'), ('Bob', 'bob@example.com') ON CONFLICT DO NOTHING;
+GRANT SELECT ON cs.users TO datadog;
+GRANT SELECT ON cs.users TO app_user;
+
+-- Ensure datadog has NO custom search_path
+ALTER USER datadog RESET search_path;
+"
+```
+
+**How to Reproduce:**
+
+Check the search_path configuration:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+SELECT rolname, rolconfig FROM pg_roles WHERE rolname IN ('datadog', 'app_user');
+"
+```
+
+**Expected output showing the problem:**
+
+```
+ rolname  |         rolconfig          
+----------+----------------------------
+ app_user | {search_path=cs, public}
+ datadog  | 
+(2 rows)
+```
+
+**Verify app_user can query without schema prefix:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U app_user -d demo_app -c "
+SHOW search_path;
+SELECT * FROM users;
+"
+```
+
+**Expected output:** ✅ Works because app_user has search_path set to cs
+
+**Verify datadog user FAILS (simulating what the Agent does with PREPARE):**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SHOW search_path;
+PREPARE dd_test AS SELECT * FROM users WHERE id = \$1;
+"
+```
+
+**Expected error:**
+
+```
+   search_path   
+-----------------
+ "$user", public
+(1 row)
+
+ERROR:  relation "users" does not exist
+```
+
+This is what causes `failed_to_explain_with_prepared_statement` in the Agent.
+
+**Fix:**
+
+Set the search_path for the datadog user to match the application user:
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+ALTER USER datadog SET search_path TO cs, public;
+"
+```
+
+**Verify Fix:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'datadog';
+"
+```
+
+**Expected output after fix:**
+
+```
+ rolname |         rolconfig          
+---------+----------------------------
+ datadog | {search_path=cs, public}
+(1 row)
+```
+
+**Verify PREPARE now works:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SHOW search_path;
+PREPARE dd_test2 AS SELECT * FROM users WHERE id = \$1;
+"
+```
+
+**Expected output:** ✅ `PREPARE` succeeds
+
+**Generate queries via curl (to trigger the issue):**
+
+```bash
+# Port-forward the demo-app
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+
+# Generate parameterized queries (app_user uses search_path=cs)
+curl http://localhost:8080/query/users/1
+curl http://localhost:8080/query/users/2
+curl http://localhost:8080/generate/50
+
+# These queries appear in pg_stat_statements as:
+# SELECT * FROM users WHERE id = $1
+# The Agent will try to PREPARE this query as datadog user
+# Without the correct search_path, PREPARE fails
+```
+
+**Important Notes:**
+- The search_path change only applies to NEW connections
+- The Datadog Agent needs to reconnect (or restart) to pick up the new search_path
+- You can restart the agent with: `kubectl rollout restart daemonset/datadog-agent -n datadog`
 
 ---
 

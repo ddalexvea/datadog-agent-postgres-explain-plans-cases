@@ -264,6 +264,7 @@ spec:
               cat > /app.py << 'EOF'
               from flask import Flask, jsonify
               import psycopg2
+              import os
               
               app = Flask(__name__)
               
@@ -367,6 +368,11 @@ spec:
               python /app.py
           ports:
             - containerPort: 8080
+          env:
+            - name: PGHOST
+              value: "postgres"
+            - name: PGPORT
+              value: "5432"
           resources:
             requests:
               memory: "128Mi"

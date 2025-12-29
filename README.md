@@ -700,6 +700,13 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 ERROR:  Simulated configuration error
 ```
 
+**Generate queries via curl:**
+
+```bash
+# Generate queries to trigger the error (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+```
+
 **Fix:**
 
 Restore the correct `explain_statement` function:
@@ -793,6 +800,13 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 
 ```
 ERROR:  permission denied for table users
+```
+
+**Generate queries via curl:**
+
+```bash
+# Generate SELECT FOR UPDATE queries (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/query/users/1/lock > /dev/null; done
 ```
 
 **Fix:**
@@ -983,16 +997,12 @@ PREPARE dd_test2 AS SELECT * FROM users WHERE id = \$1;
 
 **Expected output:** ✅ `PREPARE` succeeds
 
-**Generate queries via curl (to trigger the issue):**
+**Generate queries via curl:**
 
 ```bash
-# Port-forward the demo-app
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-
 # Generate parameterized queries (app_user uses search_path=cs)
-curl http://localhost:8080/query/users/1
-curl http://localhost:8080/query/users/2
-curl http://localhost:8080/generate/50
+# Run for 60 seconds to ensure agent collects explain plans
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
 
 # These queries appear in pg_stat_statements as:
 # SELECT * FROM users WHERE id = $1

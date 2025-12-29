@@ -225,6 +225,132 @@ spec:
       targetPort: 5432
 ```
 
+#### app/demo-app.yaml
+
+```yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: postgres-demo
+  labels:
+    app: demo-app
+    tags.datadoghq.com/env: sandbox
+    tags.datadoghq.com/service: demo-app
+    tags.datadoghq.com/version: "1.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+        tags.datadoghq.com/env: sandbox
+        tags.datadoghq.com/service: demo-app
+        tags.datadoghq.com/version: "1.0"
+    spec:
+      containers:
+        - name: demo-app
+          image: python:3.11-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install flask psycopg2-binary
+              
+              cat > /app.py << 'EOF'
+              from flask import Flask, jsonify
+              import psycopg2
+              
+              app = Flask(__name__)
+              
+              def get_connection(user='postgres', password='datadog123'):
+                  return psycopg2.connect(
+                      host='postgres',
+                      port=5432,
+                      dbname='demo_app',
+                      user=user,
+                      password=password
+                  )
+              
+              @app.route('/health')
+              def health():
+                  return jsonify({"status": "ok"})
+              
+              @app.route('/query/users/<int:user_id>')
+              def query_user(user_id):
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+                  result = cur.fetchone()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"user": result})
+              
+              @app.route('/query/users')
+              def query_all_users():
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM users")
+                  results = cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"users": results})
+              
+              @app.route('/query/users/<int:user_id>/lock')
+              def query_user_lock(user_id):
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
+                  result = cur.fetchone()
+                  conn.commit()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"user_locked": result})
+              
+              @app.route('/generate/<int:count>')
+              def generate_queries(count):
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  for i in range(count):
+                      cur.execute("SELECT * FROM users WHERE id = %s", ((i % 3) + 1,))
+                      cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"generated": count})
+              
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+              
+              python /app.py
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: postgres-demo
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+```
+
 #### datadog/values.yaml
 
 ```yaml

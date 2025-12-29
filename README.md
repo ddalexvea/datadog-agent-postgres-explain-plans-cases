@@ -354,7 +354,7 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 
 ## Case 2: Table Not in Search Path (`undefined_table`)
 
-![Case 2 - Undefined Table](case2_1.png)
+![Case 2 - Undefined Table](case2.png)
 
 **UI Message:** "The Agent can't find one or more tables. Try altering the datadog user's search path."
 
@@ -464,25 +464,59 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 
 **Description:**
 
-This error occurs when the query text is truncated because it exceeds the `track_activity_query_size` PostgreSQL setting.
+This error occurs when the query text is truncated because it exceeds the `track_activity_query_size` PostgreSQL setting. Since this parameter has context=`postmaster`, it requires a PostgreSQL restart to take effect.
 
 **How to Reproduce:**
 
-```bash
-# Set a very small track_activity_query_size
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-ALTER SYSTEM SET track_activity_query_size = 100;
-SELECT pg_reload_conf();
-"
+Modify the PostgreSQL deployment to set a very small `track_activity_query_size`:
 
-# Restart PostgreSQL to apply
-kubectl rollout restart deployment/postgres -n postgres-demo
+```bash
+# Patch the PostgreSQL deployment to set track_activity_query_size=100
+kubectl patch deployment postgres -n postgres-demo --type='json' -p='[
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/args",
+    "value": [
+      "-c", "shared_preload_libraries=pg_stat_statements",
+      "-c", "pg_stat_statements.track=all",
+      "-c", "track_activity_query_size=100"
+    ]
+  }
+]'
+
+# Wait for PostgreSQL to restart
+kubectl rollout status deployment/postgres -n postgres-demo
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 ```
 
-**Verify the issue:**
+**Verify the setting:**
 
-Long queries will be truncated and cannot be explained.
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "SHOW track_activity_query_size;"
+```
+
+**Expected output:**
+
+```
+ track_activity_query_size 
+---------------------------
+ 100
+(1 row)
+```
+
+**Note:** After restart, you may need to re-create the database objects (users, tables, etc.) since `emptyDir` is used for storage.
+
+**Check Agent Logs for Truncation Errors:**
+
+```bash
+kubectl logs -n datadog $(kubectl get pods -n datadog -l app=datadog-agent -o jsonpath='{.items[0].metadata.name}') -c agent | grep -i truncat
+```
+
+**Expected agent log warning:**
+
+```
+WARN | postgres:134e963aad76cbab | (statement_samples.py:1046) | Statement with query_signature=383cca14cd93c993 was truncated. Query size: 99, track_activity_query_size: 100 See https://docs.datadoghq.com/database_monitoring/setup_postgres/troubleshooting#query-samples-are-truncated for more details on how to increase the track_activity_query_size setting.
+```
 
 **Generate queries via curl:**
 
@@ -493,9 +527,25 @@ end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:80
 
 **Fix:**
 
-```sql
-ALTER SYSTEM SET track_activity_query_size = 4096;  -- or higher
-SELECT pg_reload_conf();
+Restore the `track_activity_query_size` to a reasonable value (4096 or higher):
+
+```bash
+# Patch the PostgreSQL deployment to restore track_activity_query_size
+kubectl patch deployment postgres -n postgres-demo --type='json' -p='[
+  {
+    "op": "replace",
+    "path": "/spec/template/spec/containers/0/args",
+    "value": [
+      "-c", "shared_preload_libraries=pg_stat_statements",
+      "-c", "pg_stat_statements.track=all",
+      "-c", "track_activity_query_size=4096"
+    ]
+  }
+]'
+
+# Wait for PostgreSQL to restart
+kubectl rollout status deployment/postgres -n postgres-demo
+kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 ```
 
 ---

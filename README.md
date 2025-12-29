@@ -225,6 +225,143 @@ spec:
       targetPort: 5432
 ```
 
+#### app/demo-app.yaml
+
+```yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: postgres-demo
+  labels:
+    app: demo-app
+    tags.datadoghq.com/env: sandbox
+    tags.datadoghq.com/service: demo-app
+    tags.datadoghq.com/version: "1.0"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+        tags.datadoghq.com/env: sandbox
+        tags.datadoghq.com/service: demo-app
+        tags.datadoghq.com/version: "1.0"
+    spec:
+      containers:
+        - name: demo-app
+          image: python:3.11-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install flask psycopg2-binary
+              
+              cat > /app.py << 'EOF'
+              from flask import Flask, jsonify
+              import psycopg2
+              
+              app = Flask(__name__)
+              
+              def get_connection(user='app_user', password='app_password'):
+                  return psycopg2.connect(
+                      host='postgres',
+                      port=5432,
+                      dbname='demo_app',
+                      user=user,
+                      password=password
+                  )
+              
+              @app.route('/health')
+              def health():
+                  return jsonify({"status": "ok"})
+              
+              @app.route('/generate/<int:count>')
+              def generate_queries(count):
+                  """Generate queries to 'users' table WITHOUT schema prefix.
+                  Used for: Case 0, 1, 3, 4"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  for i in range(count):
+                      cur.execute("SELECT * FROM users WHERE id = %s", ((i % 3) + 1,))
+                      cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"generated": count})
+              
+              @app.route('/generate/custom/<int:count>')
+              def generate_custom_queries(count):
+                  """Generate queries to 'custom_table' WITHOUT schema prefix.
+                  Used for: Case 2 (undefined_table)"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  for i in range(count):
+                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
+                      cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"generated": count})
+              
+              @app.route('/query/users/<int:user_id>/lock')
+              def query_user_lock(user_id):
+                  """SELECT FOR UPDATE - requires UPDATE privilege.
+                  Used for: Case 5"""
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
+                  result = cur.fetchone()
+                  conn.commit()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"user_locked": result})
+              
+              if __name__ == '__main__':
+                  app.run(host='0.0.0.0', port=8080)
+              EOF
+              
+              python /app.py
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PGHOST
+              value: "postgres"
+            - name: PGPORT
+              value: "5432"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: postgres-demo
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - port: 8080
+      targetPort: 8080
+  type: ClusterIP
+```
+
+**Endpoints Summary:**
+
+| Endpoint | Description | Used for |
+|----------|-------------|----------|
+| `/health` | Health check | - |
+| `/generate/<count>` | Query `users` without schema prefix | Case 0, 1, 3, 4 |
+| `/generate/custom/<count>` | Query `custom_table` without schema prefix | Case 2 |
+| `/query/users/<id>/lock` | SELECT FOR UPDATE | Case 5 |
+
 #### datadog/values.yaml
 
 ```yaml
@@ -251,10 +388,24 @@ kubectl apply -f postgres/postgres-deployment.yaml
 # Wait for PostgreSQL to be ready
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 
+# Deploy demo-app
+kubectl apply -f app/demo-app.yaml
+
+# Wait for demo-app to be ready
+kubectl wait --for=condition=ready pod -l app=demo-app -n postgres-demo --timeout=120s
+
 # Deploy Datadog Agent
 kubectl create namespace datadog
 kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
+helm repo add datadog https://helm.datadoghq.com
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
+```
+
+### Step 4: Port-forward demo-app
+
+```bash
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+curl http://localhost:8080/health
 ```
 
 ---

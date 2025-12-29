@@ -303,6 +303,31 @@ spec:
                   conn.close()
                   return jsonify({"users": results})
               
+              @app.route('/query/custom/<int:item_id>')
+              def query_custom(item_id):
+                  """Query custom_table WITHOUT schema prefix - triggers undefined_table (Case 2)
+                  app_user has search_path=custom_schema, datadog does not"""
+                  conn = get_connection()  # Uses app_user with search_path=custom_schema
+                  cur = conn.cursor()
+                  cur.execute("SELECT * FROM custom_table WHERE id = %s", (item_id,))
+                  result = cur.fetchone()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"custom": result})
+              
+              @app.route('/generate/custom/<int:count>')
+              def generate_custom_queries(count):
+                  """Generate queries to custom_table - triggers undefined_table (Case 2)
+                  app_user has search_path=custom_schema, datadog does not"""
+                  conn = get_connection()  # Uses app_user with search_path=custom_schema
+                  cur = conn.cursor()
+                  for i in range(count):
+                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
+                      cur.fetchall()
+                  cur.close()
+                  conn.close()
+                  return jsonify({"generated": count})
+              
               @app.route('/query/cs/users/<int:user_id>')
               def query_user_schema(user_id):
                   """Query users table WITH schema prefix - works correctly"""
@@ -551,25 +576,79 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 
 **Description:**
 
-This error occurs when a query references a table in a schema that's not in the search path, and the table name is not schema-qualified.
+This error occurs when an application uses a custom schema in its `search_path`, but the Datadog user does not have the same search_path. The application queries a table without a schema prefix (e.g., `SELECT * FROM custom_table`), but when the Datadog Agent tries to explain this query, it fails because `custom_table` is not in the Datadog user's search_path.
 
-**How to Reproduce:**
+**The Problem:**
+- `app_user` has `search_path = custom_schema, public` → can query `SELECT * FROM custom_table`
+- `datadog` user has `search_path = "$user", public` (default) → **cannot find** `custom_table`
+- Result: `undefined_table` error in Datadog UI
+
+**Setup:**
 
 ```bash
-# Create a table in a non-public schema
+# Create custom_schema and table, configure app_user search_path
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+-- Create custom schema
 CREATE SCHEMA IF NOT EXISTS custom_schema;
-CREATE TABLE IF NOT EXISTS custom_schema.custom_table (id INT PRIMARY KEY, data TEXT);
+
+-- Create custom_table in custom_schema
+CREATE TABLE IF NOT EXISTS custom_schema.custom_table (
+    id INT PRIMARY KEY,
+    data TEXT
+);
+INSERT INTO custom_schema.custom_table VALUES (1, 'test1'), (2, 'test2'), (3, 'test3') ON CONFLICT DO NOTHING;
+
+-- Grant permissions to app_user
+GRANT USAGE ON SCHEMA custom_schema TO app_user;
+GRANT SELECT ON custom_schema.custom_table TO app_user;
+
+-- Set app_user search_path to include custom_schema
+ALTER USER app_user SET search_path TO custom_schema, public;
+
+-- Grant permissions to datadog (for schema access, but NOT search_path)
 GRANT USAGE ON SCHEMA custom_schema TO datadog;
 GRANT SELECT ON custom_schema.custom_table TO datadog;
+
+-- Ensure datadog has default search_path (does NOT include custom_schema)
+ALTER USER datadog RESET search_path;
 "
 ```
 
-**Verify the issue:**
+**Verify the Setup:**
 
 ```bash
-# Query uses unqualified table name - will fail
+# Check search_path for both users
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+SELECT rolname, rolconfig FROM pg_roles WHERE rolname IN ('datadog', 'app_user');
+"
+```
+
+**Expected output showing the problem:**
+
+```
+ rolname  |            rolconfig            
+----------+---------------------------------
+ app_user | {search_path=custom_schema, public}
+ datadog  | 
+(2 rows)
+```
+
+**Verify app_user can query without schema prefix:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U app_user -d demo_app -c "
+SHOW search_path;
+SELECT * FROM custom_table;
+"
+```
+
+**Expected output:** ✅ Works because app_user has search_path set to custom_schema
+
+**Verify datadog user FAILS:**
+
+```bash
 kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SHOW search_path;
 SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 "
 ```
@@ -577,6 +656,11 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 **Expected error:**
 
 ```
+   search_path   
+-----------------
+ "$user", public
+(1 row)
+
 ERROR:  relation "custom_table" does not exist
 ```
 
@@ -584,19 +668,34 @@ ERROR:  relation "custom_table" does not exist
 
 ```bash
 # Generate queries to trigger the error (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/custom/50 > /dev/null; done
 ```
 
 **Fix:**
 
-Use schema-qualified table names in queries, or add the schema to search_path:
+Add the schema to the Datadog user's search_path:
 
-```sql
--- Option 1: Schema-qualified name works
-SELECT datadog.explain_statement('SELECT * FROM custom_schema.custom_table WHERE id = 1');
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
+ALTER ROLE datadog SET search_path TO custom_schema, public;
+"
+```
 
--- Option 2: Add schema to search_path
-ALTER ROLE datadog SET search_path TO public, custom_schema;
+**Verify Fix:**
+
+```bash
+kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
+SHOW search_path;
+SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
+"
+```
+
+**Expected output:** ✅ Returns JSON explain plan
+
+**Note:** After changing the search_path, restart the Datadog Agent to pick up the new setting:
+
+```bash
+kubectl rollout restart daemonset/datadog-agent -n datadog
 ```
 
 ---

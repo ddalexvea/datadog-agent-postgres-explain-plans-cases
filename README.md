@@ -434,7 +434,7 @@ helm repo add datadog https://helm.datadoghq.com
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
 ```
 
-### Step 4: Generate queries via curl
+### Step 4: Port-forward demo-app
 
 ```bash
 # Port-forward the demo-app
@@ -442,31 +442,11 @@ kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
 
 # Health check
 curl http://localhost:8080/health
-
-# Query single user (parameterized query)
-curl http://localhost:8080/query/users/1
-curl http://localhost:8080/query/users/2
-
-# Query all users
-curl http://localhost:8080/query/users
-
-# SELECT FOR UPDATE (Case 5)
-curl http://localhost:8080/query/users/1/lock
-
-# Generate many queries (for DBM visibility)
-curl http://localhost:8080/generate/100
-
-# Generate in bulk
-for i in {1..10}; do curl -s http://localhost:8080/generate/100; done
-
-# Generate with prepared statements (cs.users)
-for i in {1..50}; do curl -s http://localhost:8080/generate/schema/100; done
-
-# Generate continuously for 60 seconds (explain plans are collected every minute)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/schema/50 > /dev/null; done
 ```
 
 Queries will appear in Datadog DBM UI at: https://app.datadoghq.com/databases
+
+> **Note:** Each case below includes specific curl commands to generate the queries needed to reproduce that issue.
 
 ---
 
@@ -486,6 +466,13 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 ```
 
 **Expected output:** JSON explain plan is returned successfully.
+
+**Generate queries via curl:**
+
+```bash
+# Generate queries to see in Datadog DBM UI (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+```
 
 ---
 
@@ -519,6 +506,13 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 
 ```
 ERROR:  function datadog.explain_statement(unknown) does not exist
+```
+
+**Generate queries via curl:**
+
+```bash
+# Generate queries to trigger the error (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
 ```
 
 **Fix:**
@@ -586,6 +580,13 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 ERROR:  relation "custom_table" does not exist
 ```
 
+**Generate queries via curl:**
+
+```bash
+# Generate queries to trigger the error (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+```
+
 **Fix:**
 
 Use schema-qualified table names in queries, or add the schema to search_path:
@@ -601,6 +602,7 @@ ALTER ROLE datadog SET search_path TO public, custom_schema;
 ---
 
 ## Case 3: Query Truncation (`query_truncated`)
+
 
 **UI Message:** "Explain plan unavailable due to query truncation"
 
@@ -625,6 +627,13 @@ kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeou
 **Verify the issue:**
 
 Long queries will be truncated and cannot be explained.
+
+**Generate queries via curl:**
+
+```bash
+# Generate queries to trigger the error (run for 60 seconds)
+end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+```
 
 **Fix:**
 
@@ -722,7 +731,6 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ---
 
 ## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
-![Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege](case5.png)
 
 **UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
 

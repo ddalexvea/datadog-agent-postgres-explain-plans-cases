@@ -225,145 +225,6 @@ spec:
       targetPort: 5432
 ```
 
-#### app/demo-app.yaml
-
-```yaml
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: demo-app
-  namespace: postgres-demo
-  labels:
-    app: demo-app
-    tags.datadoghq.com/env: sandbox
-    tags.datadoghq.com/service: demo-app
-    tags.datadoghq.com/version: "1.0"
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: demo-app
-  template:
-    metadata:
-      labels:
-        app: demo-app
-        tags.datadoghq.com/env: sandbox
-        tags.datadoghq.com/service: demo-app
-        tags.datadoghq.com/version: "1.0"
-    spec:
-      containers:
-        - name: demo-app
-          image: python:3.11-slim
-          command:
-            - /bin/bash
-            - -c
-            - |
-              pip install flask psycopg2-binary
-              
-              cat > /app.py << 'EOF'
-              from flask import Flask, jsonify
-              import psycopg2
-              
-              app = Flask(__name__)
-              
-              def get_connection(user='app_user', password='app_password'):
-                  return psycopg2.connect(
-                      host='postgres',
-                      port=5432,
-                      dbname='demo_app',
-                      user=user,
-                      password=password
-                  )
-              
-              @app.route('/health')
-              def health():
-                  return jsonify({"status": "ok"})
-              
-              @app.route('/generate/<int:count>')
-              def generate_queries(count):
-                  """Generate queries to 'users' table WITHOUT schema prefix.
-                  Used for: Case 0, 1, 3, 4, 6
-                  app_user has search_path=cs,public so it finds cs.users"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  for i in range(count):
-                      cur.execute("SELECT * FROM users WHERE id = %s", ((i % 3) + 1,))
-                      cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"generated": count})
-              
-              @app.route('/generate/custom/<int:count>')
-              def generate_custom_queries(count):
-                  """Generate queries to 'custom_table' WITHOUT schema prefix.
-                  Used for: Case 2 (undefined_table)
-                  app_user has search_path=custom_schema,public but datadog does not"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  for i in range(count):
-                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
-                      cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"generated": count})
-              
-              @app.route('/query/users/<int:user_id>/lock')
-              def query_user_lock(user_id):
-                  """SELECT FOR UPDATE - requires UPDATE privilege.
-                  Used for: Case 5"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
-                  result = cur.fetchone()
-                  conn.commit()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"user_locked": result})
-              
-              if __name__ == '__main__':
-                  app.run(host='0.0.0.0', port=8080)
-              EOF
-              
-              python /app.py
-          ports:
-            - containerPort: 8080
-          env:
-            - name: PGHOST
-              value: "postgres"
-            - name: PGPORT
-              value: "5432"
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "200m"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: demo-app
-  namespace: postgres-demo
-spec:
-  selector:
-    app: demo-app
-  ports:
-    - port: 8080
-      targetPort: 8080
-  type: ClusterIP
-```
-
-**Endpoints Summary:**
-
-| Endpoint | Description | Used for |
-|----------|-------------|----------|
-| `/health` | Health check | - |
-| `/generate/<count>` | Query `users` without schema prefix | Case 0, 1, 3, 4, 6 |
-| `/generate/custom/<count>` | Query `custom_table` without schema prefix | Case 2 |
-| `/query/users/<id>/lock` | SELECT FOR UPDATE | Case 5 |
-
 #### datadog/values.yaml
 
 ```yaml
@@ -390,32 +251,11 @@ kubectl apply -f postgres/postgres-deployment.yaml
 # Wait for PostgreSQL to be ready
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 
-# Deploy demo-app
-kubectl apply -f app/demo-app.yaml
-
-# Wait for demo-app to be ready
-kubectl wait --for=condition=ready pod -l app=demo-app -n postgres-demo --timeout=120s
-
 # Deploy Datadog Agent
 kubectl create namespace datadog
 kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
-helm repo add datadog https://helm.datadoghq.com
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
 ```
-
-### Step 4: Port-forward demo-app
-
-```bash
-# Port-forward the demo-app
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-
-# Health check
-curl http://localhost:8080/health
-```
-
-Queries will appear in Datadog DBM UI at: https://app.datadoghq.com/databases
-
-> **Note:** Each case below includes specific curl commands to generate the queries needed to reproduce that issue.
 
 ---
 
@@ -445,15 +285,15 @@ end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:80
 
 ---
 
-## Case 1: Missing `datadog.explain_statement` Function (`undefined_function`)
+## Case 1: Missing Schema / Function (`invalid_schema`)
 
 ![Case 1 - Missing Function](case1.png)
 
-**UI Message:** "Unable to collect explain plan. There could be a problem with the function used to collect Explain Plans."
+**UI Message:** "Missing function in the datadog schema"
 
 **Description:**
 
-This error appears when the `datadog.explain_statement` function doesn't exist. The Agent tries to use this function first, and when it fails, falls back to using `PREPARE` statements which may also fail.
+This error appears when the `datadog.explain_statement` function doesn't exist or the datadog schema is missing.
 
 **How to Reproduce:**
 
@@ -514,9 +354,9 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 
 ## Case 2: Table Not in Search Path (`undefined_table`)
 
-![Case 2 - Undefined Table](case2.png)
+![Case 2 - Undefined Table](case2_1.png)
 
-**UI Message:** "The Agent can't find one or more tables"
+**UI Message:** "The Agent can't find one or more tables. Try altering the datadog user's search path."
 
 **Description:**
 
@@ -530,30 +370,20 @@ This error occurs when an application uses a custom schema in its `search_path`,
 **Setup:**
 
 ```bash
-# Create custom_schema and table, configure app_user search_path
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
--- Create custom schema
+-- Create custom schema and table
 CREATE SCHEMA IF NOT EXISTS custom_schema;
-
--- Create custom_table in custom_schema
-CREATE TABLE IF NOT EXISTS custom_schema.custom_table (
-    id INT PRIMARY KEY,
-    data TEXT
-);
+CREATE TABLE IF NOT EXISTS custom_schema.custom_table (id INT PRIMARY KEY, data TEXT);
 INSERT INTO custom_schema.custom_table VALUES (1, 'test1'), (2, 'test2'), (3, 'test3') ON CONFLICT DO NOTHING;
 
--- Grant permissions to app_user
+-- Grant permissions to app_user (has custom_schema in search_path)
 GRANT USAGE ON SCHEMA custom_schema TO app_user;
 GRANT SELECT ON custom_schema.custom_table TO app_user;
-
--- Set app_user search_path to include custom_schema
 ALTER USER app_user SET search_path TO custom_schema, public;
 
--- Grant permissions to datadog (for schema access, but NOT search_path)
+-- Grant permissions to datadog (but NOT custom_schema in search_path)
 GRANT USAGE ON SCHEMA custom_schema TO datadog;
 GRANT SELECT ON custom_schema.custom_table TO datadog;
-
--- Ensure datadog has default search_path (does NOT include custom_schema)
 ALTER USER datadog RESET search_path;
 "
 ```
@@ -561,32 +391,20 @@ ALTER USER datadog RESET search_path;
 **Verify the Setup:**
 
 ```bash
-# Check search_path for both users
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
 SELECT rolname, rolconfig FROM pg_roles WHERE rolname IN ('datadog', 'app_user');
 "
 ```
 
-**Expected output showing the problem:**
+**Expected output:**
 
 ```
- rolname  |            rolconfig            
-----------+---------------------------------
+ rolname  |              rolconfig              
+----------+-------------------------------------
  app_user | {search_path=custom_schema, public}
  datadog  | 
 (2 rows)
 ```
-
-**Verify app_user can query without schema prefix:**
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U app_user -d demo_app -c "
-SHOW search_path;
-SELECT * FROM custom_table;
-"
-```
-
-**Expected output:** ✅ Works because app_user has search_path set to custom_schema
 
 **Verify datadog user FAILS:**
 
@@ -603,7 +421,6 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
    search_path   
 -----------------
  "$user", public
-(1 row)
 
 ERROR:  relation "custom_table" does not exist
 ```
@@ -623,6 +440,9 @@ Add the schema to the Datadog user's search_path:
 kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
 ALTER ROLE datadog SET search_path TO custom_schema, public;
 "
+
+# Restart the agent to pick up the new search_path
+kubectl rollout restart daemonset/datadog-agent -n datadog
 ```
 
 **Verify Fix:**
@@ -636,16 +456,9 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 
 **Expected output:** ✅ Returns JSON explain plan
 
-**Note:** After changing the search_path, restart the Datadog Agent to pick up the new setting:
-
-```bash
-kubectl rollout restart daemonset/datadog-agent -n datadog
-```
-
 ---
 
 ## Case 3: Query Truncation (`query_truncated`)
-
 
 **UI Message:** "Explain plan unavailable due to query truncation"
 
@@ -688,8 +501,6 @@ SELECT pg_reload_conf();
 ---
 
 ## Case 4: Configuration Error (`database_error`)
-
-![Case 4 - Configuration Error](case4.png)
 
 **UI Message:** "Unable to collect explain plan (configuration error)"
 
@@ -896,167 +707,6 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 ```
 
 **Expected output:** ✅ Returns JSON explain plan with `LockRows` node
-
----
-
-## Case 6: Unable to Explain Parameterised Query - Search Paths (`failed_to_explain_with_prepared_statement`)
-
-**UI Message:** "Datadog agent user lacks permission"
-
-**Collection Error:** `collection_errors:[{"code":"failed_to_explain_with_prepared_statement","message":"<class 'psycopg2.errors.UndefinedTable'>"}]`
-
-**Description:**
-
-When the Datadog agent fails to collect an explain plan for a **parameterized query** (prepared statement), this is usually a result of the customer using search paths.
-
-The search path is PostgreSQL's map for where to look when someone asks for a database object without giving the full address (schema + object). By default, it checks the `public` schema, but applications often use custom schemas.
-
-**The Problem:**
-- Application uses `app_user` with `search_path = cs, public`
-- Application queries: `SELECT * FROM users WHERE id = $1` (no schema prefix)
-- Datadog user has `search_path = "$user", public` (default, doesn't include `cs`)
-- Agent tries to `PREPARE` the query → fails with "relation does not exist"
-- Result: `failed_to_explain_with_prepared_statement`
-
-**Setup:**
-
-First, create the `cs` schema and `app_user` with custom search_path:
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
--- Create custom schema
-CREATE SCHEMA IF NOT EXISTS cs;
-
--- Create app_user with custom search_path
-CREATE USER app_user WITH PASSWORD 'app_password';
-ALTER USER app_user SET search_path TO cs, public;
-GRANT USAGE ON SCHEMA cs TO app_user;
-GRANT USAGE ON SCHEMA cs TO datadog;
-
--- Create users table in cs schema only
-CREATE TABLE IF NOT EXISTS cs.users (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(100) NOT NULL,
-    email VARCHAR(100) UNIQUE NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-INSERT INTO cs.users (name, email) VALUES ('Alice', 'alice@example.com'), ('Bob', 'bob@example.com') ON CONFLICT DO NOTHING;
-GRANT SELECT ON cs.users TO datadog;
-GRANT SELECT ON cs.users TO app_user;
-
--- Ensure datadog has NO custom search_path
-ALTER USER datadog RESET search_path;
-"
-```
-
-**How to Reproduce:**
-
-Check the search_path configuration:
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-SELECT rolname, rolconfig FROM pg_roles WHERE rolname IN ('datadog', 'app_user');
-"
-```
-
-**Expected output showing the problem:**
-
-```
- rolname  |         rolconfig          
-----------+----------------------------
- app_user | {search_path=cs, public}
- datadog  | 
-(2 rows)
-```
-
-**Verify app_user can query without schema prefix:**
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U app_user -d demo_app -c "
-SHOW search_path;
-SELECT * FROM users;
-"
-```
-
-**Expected output:** ✅ Works because app_user has search_path set to cs
-
-**Verify datadog user FAILS (simulating what the Agent does with PREPARE):**
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
-SHOW search_path;
-PREPARE dd_test AS SELECT * FROM users WHERE id = \$1;
-"
-```
-
-**Expected error:**
-
-```
-   search_path   
------------------
- "$user", public
-(1 row)
-
-ERROR:  relation "users" does not exist
-```
-
-This is what causes `failed_to_explain_with_prepared_statement` in the Agent.
-
-**Fix:**
-
-Set the search_path for the datadog user to match the application user:
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-ALTER USER datadog SET search_path TO cs, public;
-"
-```
-
-**Verify Fix:**
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U postgres -d demo_app -c "
-SELECT rolname, rolconfig FROM pg_roles WHERE rolname = 'datadog';
-"
-```
-
-**Expected output after fix:**
-
-```
- rolname |         rolconfig          
----------+----------------------------
- datadog | {search_path=cs, public}
-(1 row)
-```
-
-**Verify PREPARE now works:**
-
-```bash
-kubectl exec -n postgres-demo deployment/postgres -- psql -U datadog -d demo_app -c "
-SHOW search_path;
-PREPARE dd_test2 AS SELECT * FROM users WHERE id = \$1;
-"
-```
-
-**Expected output:** ✅ `PREPARE` succeeds
-
-**Generate queries via curl:**
-
-```bash
-# Generate parameterized queries (app_user uses search_path=cs)
-# Run for 60 seconds to ensure agent collects explain plans
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
-
-# These queries appear in pg_stat_statements as:
-# SELECT * FROM users WHERE id = $1
-# The Agent will try to PREPARE this query as datadog user
-# Without the correct search_path, PREPARE fails
-```
-
-**Important Notes:**
-- The search_path change only applies to NEW connections
-- The Datadog Agent needs to reconnect (or restart) to pick up the new search_path
-- You can restart the agent with: `kubectl rollout restart daemonset/datadog-agent -n datadog`
 
 ---
 

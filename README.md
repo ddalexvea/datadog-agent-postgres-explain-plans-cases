@@ -163,11 +163,15 @@ spec:
                 "port": 5432,
                 "username": "datadog",
                 "password": "datadog_password",
-                "dbname": "demo_app",
+                "dbname": "app_db",
                 "dbm": true,
-                "query_samples": {"enabled": true},
-                "query_metrics": {"enabled": true},
-                "collect_settings": {"enabled": true}
+                "query_samples": {
+                  "enabled": true,
+                  "collection_interval": 1,
+                  "explained_queries_per_hour_per_query": 600,
+                  "samples_per_hour_per_query": 300,
+                  "explain_parameterized_queries": true
+                }
               }]
             }
           }
@@ -229,6 +233,297 @@ spec:
 
 ```yaml
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-app-code
+  namespace: postgres-demo
+data:
+  main.py: |
+    import os
+    import time
+    import random
+    import threading
+    import psycopg2
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+
+    # Auto-traffic configuration
+    AUTO_TRAFFIC_ENABLED = os.environ.get('AUTO_TRAFFIC_ENABLED', 'true').lower() == 'true'
+    AUTO_TRAFFIC_INTERVAL = int(os.environ.get('AUTO_TRAFFIC_INTERVAL', '5'))  # seconds between batches
+    AUTO_TRAFFIC_QUERIES_PER_BATCH = int(os.environ.get('AUTO_TRAFFIC_QUERIES_PER_BATCH', '10'))
+
+    def get_db_connection():
+        return psycopg2.connect(
+            host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
+            port=os.environ.get('POSTGRES_PORT', 5432),
+            dbname=os.environ.get('POSTGRES_DB', 'app_db'),
+            user=os.environ.get('POSTGRES_USER', 'postgres'),
+            password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
+        )
+
+    # ============================================
+    # AUTO TRAFFIC GENERATOR (Background Thread)
+    # ============================================
+    
+    QUERY_POOL = [
+        # Case 0: Working State (baseline) - normal queries with pg_sleep
+        "SELECT pg_sleep(0.1), * FROM users WHERE id = {user_id}",
+        "SELECT pg_sleep(0.1), * FROM orders WHERE status = 'completed'",
+        "SELECT pg_sleep(0.1), u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id",
+        
+        # Case 2: undefined_table - query without schema prefix (will fail if search_path wrong)
+        "SELECT pg_sleep(0.1), * FROM custom_table WHERE id = {user_id}",
+        
+        # Case 5: SELECT FOR UPDATE - requires UPDATE privilege for explain
+        "SELECT pg_sleep(0.1), * FROM users WHERE id = {user_id} FOR UPDATE",
+        "SELECT pg_sleep(0.1), * FROM orders WHERE id = {user_id} FOR UPDATE",
+    ]
+
+    def generate_traffic_batch():
+        """Generate a batch of random queries"""
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            for _ in range(AUTO_TRAFFIC_QUERIES_PER_BATCH):
+                query_template = random.choice(QUERY_POOL)
+                # Replace placeholders with random values
+                query = query_template.format(
+                    user_id=random.randint(1, 3),
+                    order_id=random.randint(1, 4)
+                )
+                try:
+                    cur.execute(query)
+                    cur.fetchall()
+                except Exception as e:
+                    print(f"Query error (expected for some cases): {e}")
+            
+            cur.close()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Traffic generation error: {e}")
+            if conn:
+                conn.close()
+            return False
+
+    def auto_traffic_loop():
+        """Background thread that continuously generates traffic"""
+        print(f"🚀 Auto-traffic generator started (interval: {AUTO_TRAFFIC_INTERVAL}s, queries/batch: {AUTO_TRAFFIC_QUERIES_PER_BATCH})")
+        
+        # Wait for PostgreSQL to be fully ready
+        time.sleep(10)
+        
+        batch_count = 0
+        while True:
+            success = generate_traffic_batch()
+            batch_count += 1
+            if success and batch_count % 10 == 0:
+                print(f"📊 Auto-traffic: {batch_count} batches executed ({batch_count * AUTO_TRAFFIC_QUERIES_PER_BATCH} total queries)")
+            time.sleep(AUTO_TRAFFIC_INTERVAL)
+
+    # ============================================
+    # REST API ENDPOINTS
+    # ============================================
+
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "healthy", "auto_traffic": AUTO_TRAFFIC_ENABLED})
+
+    @app.route('/')
+    def home():
+        return jsonify({
+            "message": "PostgreSQL DBM Demo App",
+            "auto_traffic": {
+                "enabled": AUTO_TRAFFIC_ENABLED,
+                "interval_seconds": AUTO_TRAFFIC_INTERVAL,
+                "queries_per_batch": AUTO_TRAFFIC_QUERIES_PER_BATCH
+            },
+            "endpoints": {
+                "/health": "Health check",
+                "/users": "List all users",
+                "/orders": "List all orders",
+                "/orders/stats": "Order statistics with aggregations",
+                "/generate-traffic": "Manually trigger traffic generation",
+                "/slow-query": "Execute a slow query",
+                "/long-query": "Execute a long query (for truncation test)",
+                "/restricted": "Query restricted schema (permission test)",
+                "/users/<id>/lock-slow": "SELECT FOR UPDATE with delay"
+            }
+        })
+
+    @app.route('/users')
+    def get_users():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, email, created_at FROM users")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"users": [{"id": u[0], "name": u[1], "email": u[2]} for u in users]})
+
+    @app.route('/orders')
+    def get_orders():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT o.id, u.name, o.amount, o.status, o.created_at
+            FROM orders o
+            JOIN users u ON o.user_id = u.id
+            ORDER BY o.created_at DESC
+        """)
+        orders = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"orders": [
+            {"id": o[0], "user": o[1], "amount": float(o[2]), "status": o[3]}
+            for o in orders
+        ]})
+
+    @app.route('/orders/stats')
+    def get_order_stats():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                u.name,
+                COUNT(o.id) as order_count,
+                SUM(o.amount) as total_amount,
+                AVG(o.amount) as avg_amount
+            FROM users u
+            LEFT JOIN orders o ON u.id = o.user_id
+            GROUP BY u.id, u.name
+            HAVING COUNT(o.id) > 0
+            ORDER BY total_amount DESC
+        """)
+        stats = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"stats": [
+            {"user": s[0], "order_count": s[1], "total": float(s[2]), "average": float(s[3])}
+            for s in stats
+        ]})
+
+    @app.route('/slow-query')
+    def slow_query():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT pg_sleep(0.5), * FROM orders WHERE status IN ('pending', 'shipped')")
+        orders = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Slow query completed", "count": len(orders)})
+
+    @app.route('/generate-traffic')
+    def generate_traffic():
+        """Manually trigger a batch of traffic"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        queries = [
+            "SELECT COUNT(*) FROM users",
+            "SELECT * FROM orders WHERE status = 'completed'",
+            "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name",
+            "SELECT * FROM orders WHERE amount > 100 ORDER BY amount DESC",
+            "SELECT DISTINCT status FROM orders",
+        ]
+        results = []
+        for q in queries:
+            cur.execute(q)
+            results.append({"query": q[:50] + "...", "rows": cur.rowcount})
+        cur.close()
+        conn.close()
+        return jsonify({"executed_queries": len(queries), "results": results})
+
+    @app.route('/restricted')
+    def get_restricted():
+        """
+        Query restricted_schema.secret_table using psycopg3 (extended query protocol).
+        This generates parameterized queries with $1 placeholders.
+        Used to reproduce 'failed_to_explain_with_prepared_statement' error.
+        """
+        try:
+            import psycopg
+            conn = psycopg.connect(
+                host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
+                port=int(os.environ.get('POSTGRES_PORT', 5432)),
+                dbname=os.environ.get('POSTGRES_DB', 'app_db'),
+                user=os.environ.get('POSTGRES_USER', 'postgres'),
+                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
+            )
+            cur = conn.cursor()
+            # Parameterized query - will have $1 placeholder in pg_stat_statements
+            random_id = random.randint(1, 5)
+            cur.execute("SELECT * FROM restricted_schema.secret_table WHERE id = %s", (random_id,))
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return jsonify({"restricted_data": [{"id": r[0], "data": r[1]} for r in rows]})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/long-query')
+    def long_query():
+        """
+        Execute a very long query (> 4KB) to reproduce 'query_truncated' error.
+        The query will be truncated in pg_stat_statements if track_activity_query_size is low.
+        """
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Generate a query longer than 4KB (4096 bytes)
+        # 300 conditions * ~20 chars each = ~6000 chars
+        conditions = ' OR '.join([f"name = 'longquery_test_{i}'" for i in range(300)])
+        query = f"SELECT * FROM users WHERE {conditions}"
+        try:
+            cur.execute(query)
+            rows = cur.fetchall()
+            result = {"query_length": len(query), "rows_returned": len(rows)}
+        except Exception as e:
+            result = {"query_length": len(query), "error": str(e)}
+        cur.close()
+        conn.close()
+        return jsonify(result)
+
+    @app.route('/users/<int:user_id>/lock-slow')
+    def lock_user_slow(user_id):
+        """
+        SELECT FOR UPDATE with pg_sleep(3) - takes 3+ seconds to be caught by explain plan.
+        Used to reproduce 'failed_to_explain_with_prepared_statement' error for Case 5.
+        """
+        try:
+            import psycopg
+            conn = psycopg.connect(
+                host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
+                port=int(os.environ.get('POSTGRES_PORT', 5432)),
+                dbname=os.environ.get('POSTGRES_DB', 'app_db'),
+                user=os.environ.get('POSTGRES_USER', 'postgres'),
+                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
+            )
+            cur = conn.cursor()
+            # Slow query with FOR UPDATE - 3 seconds to ensure it's caught
+            cur.execute("SELECT pg_sleep(3), * FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            rows = cur.fetchall()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return jsonify({"locked_user_id": user_id, "duration": "3s"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    if __name__ == '__main__':
+        print("Starting demo app on port 8080...")
+        
+        # Start auto-traffic generator in background thread
+        if AUTO_TRAFFIC_ENABLED:
+            traffic_thread = threading.Thread(target=auto_traffic_loop, daemon=True)
+            traffic_thread.start()
+        else:
+            print("⚠️  Auto-traffic generator is DISABLED. Set AUTO_TRAFFIC_ENABLED=true to enable.")
+        
+        app.run(host='0.0.0.0', port=8080)
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -251,86 +546,48 @@ spec:
         tags.datadoghq.com/env: sandbox
         tags.datadoghq.com/service: demo-app
         tags.datadoghq.com/version: "1.0"
+      annotations:
+        ad.datadoghq.com/demo-app.logs: '[{"source":"python","service":"demo-app"}]'
     spec:
       containers:
         - name: demo-app
           image: python:3.11-slim
-          command:
-            - /bin/bash
-            - -c
+          command: ["/bin/bash", "-c"]
+          args:
             - |
-              pip install flask psycopg2-binary
-              
-              cat > /app.py << 'EOF'
-              from flask import Flask, jsonify
-              import psycopg2
-              
-              app = Flask(__name__)
-              
-              def get_connection(user='app_user', password='app_password'):
-                  return psycopg2.connect(
-                      host='postgres',
-                      port=5432,
-                      dbname='demo_app',
-                      user=user,
-                      password=password
-                  )
-              
-              @app.route('/health')
-              def health():
-                  return jsonify({"status": "ok"})
-              
-              @app.route('/generate/<int:count>')
-              def generate_queries(count):
-                  """Generate queries to 'users' table WITHOUT schema prefix.
-                  Used for: Case 0, 1, 3, 4"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  for i in range(count):
-                      cur.execute("SELECT * FROM users WHERE id = %s", ((i % 3) + 1,))
-                      cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"generated": count})
-              
-              @app.route('/generate/custom/<int:count>')
-              def generate_custom_queries(count):
-                  """Generate queries to 'custom_table' WITHOUT schema prefix.
-                  Used for: Case 2 (undefined_table)"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  for i in range(count):
-                      cur.execute("SELECT * FROM custom_table WHERE id = %s", ((i % 3) + 1,))
-                      cur.fetchall()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"generated": count})
-              
-              @app.route('/query/users/<int:user_id>/lock')
-              def query_user_lock(user_id):
-                  """SELECT FOR UPDATE - requires UPDATE privilege.
-                  Used for: Case 5"""
-                  conn = get_connection()
-                  cur = conn.cursor()
-                  cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
-                  result = cur.fetchone()
-                  conn.commit()
-                  cur.close()
-                  conn.close()
-                  return jsonify({"user_locked": result})
-              
-              if __name__ == '__main__':
-                  app.run(host='0.0.0.0', port=8080)
-              EOF
-              
-              python /app.py
+              pip install --quiet psycopg2-binary 'psycopg[binary]' flask
+              echo "Waiting for PostgreSQL..."
+              sleep 5
+              python /app/main.py
           ports:
             - containerPort: 8080
           env:
-            - name: PGHOST
-              value: "postgres"
-            - name: PGPORT
+            - name: POSTGRES_HOST
+              value: "postgres-instance-test"
+            - name: POSTGRES_PORT
               value: "5432"
+            - name: POSTGRES_DB
+              value: "app_db"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secrets
+                  key: APP_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secrets
+                  key: APP_PASSWORD
+            # Auto-traffic configuration
+            - name: AUTO_TRAFFIC_ENABLED
+              value: "true"
+            - name: AUTO_TRAFFIC_INTERVAL
+              value: "1"
+            - name: AUTO_TRAFFIC_QUERIES_PER_BATCH
+              value: "50"
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
           resources:
             requests:
               memory: "128Mi"
@@ -338,6 +595,10 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "200m"
+      volumes:
+        - name: app-code
+          configMap:
+            name: demo-app-code
 ---
 apiVersion: v1
 kind: Service
@@ -352,15 +613,6 @@ spec:
       targetPort: 8080
   type: ClusterIP
 ```
-
-**Endpoints Summary:**
-
-| Endpoint | Description | Used for |
-|----------|-------------|----------|
-| `/health` | Health check | - |
-| `/generate/<count>` | Query `users` without schema prefix | Case 0, 1, 3, 4 |
-| `/generate/custom/<count>` | Query `custom_table` without schema prefix | Case 2 |
-| `/query/users/<id>/lock` | SELECT FOR UPDATE | Case 5 |
 
 #### datadog/values.yaml
 
@@ -388,24 +640,66 @@ kubectl apply -f postgres/postgres-deployment.yaml
 # Wait for PostgreSQL to be ready
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
 
-# Deploy demo-app
-kubectl apply -f app/demo-app.yaml
-
-# Wait for demo-app to be ready
-kubectl wait --for=condition=ready pod -l app=demo-app -n postgres-demo --timeout=120s
-
 # Deploy Datadog Agent
 kubectl create namespace datadog
 kubectl create secret generic datadog-secret -n datadog --from-literal=api-key=YOUR_API_KEY
-helm repo add datadog https://helm.datadoghq.com
 helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/values.yaml
 ```
 
-### Step 4: Port-forward demo-app
+---
+
+## Auto Traffic Generator
+
+The demo app includes an **automatic traffic generator** that runs in the background, continuously executing queries against PostgreSQL. This ensures explain plans are collected without needing to manually run curl commands.
+
+### How It Works
+
+- A background thread starts automatically when the demo app boots
+- Executes queries every second (configurable)
+- All queries include `pg_sleep(0.1)` to ensure they're caught by the DBM activity sampler
+- Uses `app_user` (not `postgres`) for realistic user separation
+
+### Queries Executed
+
+| Case | Query |
+|------|-------|
+| **Case 0** (baseline) | `SELECT pg_sleep(0.1), * FROM users WHERE id = ?` |
+| **Case 0** (baseline) | `SELECT pg_sleep(0.1), * FROM orders WHERE status = 'completed'` |
+| **Case 0** (baseline) | `SELECT pg_sleep(0.1), u.name, o.amount FROM users u JOIN orders o ON ...` |
+| **Case 2** (undefined_table) | `SELECT pg_sleep(0.1), * FROM custom_table WHERE id = ?` |
+| **Case 5** (FOR UPDATE) | `SELECT pg_sleep(0.1), * FROM users WHERE id = ? FOR UPDATE` |
+| **Case 5** (FOR UPDATE) | `SELECT pg_sleep(0.1), * FROM orders WHERE id = ? FOR UPDATE` |
+
+### Configuration
+
+The auto traffic generator can be configured via environment variables in `app/demo-app.yaml`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_TRAFFIC_ENABLED` | `true` | Enable/disable auto traffic |
+| `AUTO_TRAFFIC_INTERVAL` | `1` | Seconds between query batches |
+| `AUTO_TRAFFIC_QUERIES_PER_BATCH` | `50` | Number of queries per batch |
+
+### User Separation
+
+| User | Purpose | Used by |
+|------|---------|---------|
+| `postgres` | Superuser, DB admin | Init scripts only |
+| `app_user` | Application queries | Demo app (auto-traffic + API endpoints) |
+| `datadog` | Monitoring (read-only) | Datadog Agent (explain plans, metrics) |
+
+### Manual Traffic (Optional)
+
+You can still generate traffic manually via curl if needed:
 
 ```bash
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-curl http://localhost:8080/health
+# Port-forward first
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080
+
+# Then use curl endpoints
+curl http://localhost:8080/users
+curl http://localhost:8080/orders
+curl http://localhost:8080/generate-traffic
 ```
 
 ---
@@ -427,11 +721,15 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 
 **Expected output:** JSON explain plan is returned successfully.
 
-**Generate queries via curl:**
+**Traffic Generation:**
+
+Queries are generated automatically by the auto-traffic generator. No manual action needed.
+
+Alternatively, you can generate traffic manually via curl:
 
 ```bash
-# Generate queries to see in Datadog DBM UI (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
+kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
+curl http://localhost:8080/generate-traffic
 ```
 
 ---
@@ -468,12 +766,9 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 ERROR:  function datadog.explain_statement(unknown) does not exist
 ```
 
-**Generate queries via curl:**
+**Traffic Generation:**
 
-```bash
-# Generate queries to trigger the error (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
-```
+Queries are generated automatically by the auto-traffic generator. No manual action needed.
 
 **Fix:**
 
@@ -576,12 +871,9 @@ SELECT datadog.explain_statement('SELECT * FROM custom_table WHERE id = 1');
 ERROR:  relation "custom_table" does not exist
 ```
 
-**Generate queries via curl:**
+**Traffic Generation:**
 
-```bash
-# Generate queries to trigger the error (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/custom/50 > /dev/null; done
-```
+Queries are generated automatically by the auto-traffic generator (includes `SELECT * FROM custom_table` queries).
 
 **Fix:**
 
@@ -669,12 +961,9 @@ kubectl logs -n datadog $(kubectl get pods -n datadog -l app=datadog-agent -o js
 WARN | postgres:134e963aad76cbab | (statement_samples.py:1046) | Statement with query_signature=383cca14cd93c993 was truncated. Query size: 99, track_activity_query_size: 100 See https://docs.datadoghq.com/database_monitoring/setup_postgres/troubleshooting#query-samples-are-truncated for more details on how to increase the track_activity_query_size setting.
 ```
 
-**Generate queries via curl:**
+**Traffic Generation:**
 
-```bash
-# Generate queries to trigger the error (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
-```
+Queries are generated automatically by the auto-traffic generator. No manual action needed.
 
 **Fix:**
 
@@ -755,12 +1044,9 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 ERROR:  Simulated configuration error
 ```
 
-**Generate queries via curl:**
+**Traffic Generation:**
 
-```bash
-# Generate queries to trigger the error (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/generate/50 > /dev/null; done
-```
+Queries are generated automatically by the auto-traffic generator. No manual action needed.
 
 **Fix:**
 
@@ -793,8 +1079,6 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ---
 
 ## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
-
-![Case 5 - SELECT FOR UPDATE](case5.png)
 
 **UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
 
@@ -859,12 +1143,9 @@ SELECT * FROM users WHERE id = 1 FOR UPDATE;
 ERROR:  permission denied for table users
 ```
 
-**Generate queries via curl:**
+**Traffic Generation:**
 
-```bash
-# Generate SELECT FOR UPDATE queries (run for 60 seconds)
-end=$((SECONDS+60)); while [ $SECONDS -lt $end ]; do curl -s http://localhost:8080/query/users/1/lock > /dev/null; done
-```
+Queries are generated automatically by the auto-traffic generator (includes `SELECT ... FOR UPDATE` queries).
 
 **Fix:**
 

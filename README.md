@@ -148,8 +148,6 @@ metadata:
   namespace: postgres-demo
   labels:
     app: postgres
-    tags.datadoghq.com/env: sandbox
-    tags.datadoghq.com/service: postgres-demo
 spec:
   replicas: 1
   selector:
@@ -159,8 +157,6 @@ spec:
     metadata:
       labels:
         app: postgres
-        tags.datadoghq.com/env: sandbox
-        tags.datadoghq.com/service: postgres-demo
       annotations:
         ad.datadoghq.com/postgres.checks: |
           {
@@ -175,10 +171,8 @@ spec:
                 "dbm": true,
                 "query_samples": {
                   "enabled": true,
-                  "collection_interval": 1,
                   "explained_queries_per_hour_per_query": 600,
-                  "samples_per_hour_per_query": 300,
-                  "explain_parameterized_queries": true
+                  "samples_per_hour_per_query": 300
                 }
               }]
             }
@@ -534,28 +528,11 @@ The postgres check annotation supports extensive configuration for Database Moni
 
 ### query_samples Options
 
-| Parameter | Type | Default | Description |
+| Parameter | Type | Value | Description |
 |-----------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable collection of explain plans. Requires `dbm: true`. |
-| `collection_interval` | number | `1` | Explain plan collection interval (in seconds). Each collection involves a single query to `pg_stat_activity` followed by at most one `EXPLAIN` query per unique normalized query. |
-| `explain_function` | string | `datadog.explain_statement` | Override the default function used to collect explain plans for queries. |
-| `explained_queries_per_hour_per_query` | integer | `60` | Rate limit for how many explain plans will be collected per hour per normalized query. |
-| `samples_per_hour_per_query` | integer | `15` | Rate limit for how many explain plan events will be ingested per hour per normalized explain plan. |
-| `explained_queries_cache_maxsize` | integer | `5000` | Max size of the cache used for the `explained_queries_per_hour_per_query` rate limit. Increase for databases with many unique normalized queries. |
-| `seen_samples_cache_maxsize` | integer | `10000` | Max size of the cache used for the `samples_per_hour_per_query` rate limit. Increase for databases with many unique normalized explain plans. |
-| `explain_parameterized_queries` | boolean | `true` | Enable the ability to explain parameterized queries (useful for extended query protocol or prepared statements). |
-
-### query_metrics Options
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `enabled` | boolean | `true` | Enable collection of query metrics from `pg_stat_statements`. |
-
-### collect_settings Options
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `enabled` | boolean | `false` | Enable collection of PostgreSQL settings/configuration. |
+| `explained_queries_per_hour_per_query` | integer | set to `600` (default `60`) | Rate limit for how many explain plans will be collected per hour per normalized query. |
+| `samples_per_hour_per_query` | integer | set to `300` (default `15`) | Rate limit for how many explain plan events will be ingested per hour per normalized explain plan. |
 
 ---
 

@@ -47,6 +47,8 @@ stringData:
   POSTGRES_DB: "demo_app"
   DD_POSTGRES_USER: "datadog"
   DD_POSTGRES_PASSWORD: "datadog_password"
+  APP_USER: "app_user"
+  APP_PASSWORD: "app_password"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -132,6 +134,12 @@ data:
     
     -- Grant SELECT on public tables to datadog
     GRANT SELECT ON ALL TABLES IN SCHEMA public TO datadog;
+    
+    -- Create application user for demo app
+    CREATE USER app_user WITH PASSWORD 'app_password';
+    GRANT USAGE ON SCHEMA public TO app_user;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -163,15 +171,11 @@ spec:
                 "port": 5432,
                 "username": "datadog",
                 "password": "datadog_password",
-                "dbname": "app_db",
+                "dbname": "demo_app",
                 "dbm": true,
-                "query_samples": {
-                  "enabled": true,
-                  "collection_interval": 1,
-                  "explained_queries_per_hour_per_query": 600,
-                  "samples_per_hour_per_query": 300,
-                  "explain_parameterized_queries": true
-                }
+                "query_samples": {"enabled": true},
+                "query_metrics": {"enabled": true},
+                "collect_settings": {"enabled": true}
               }]
             }
           }
@@ -251,16 +255,16 @@ data:
 
     # Auto-traffic configuration
     AUTO_TRAFFIC_ENABLED = os.environ.get('AUTO_TRAFFIC_ENABLED', 'true').lower() == 'true'
-    AUTO_TRAFFIC_INTERVAL = int(os.environ.get('AUTO_TRAFFIC_INTERVAL', '5'))  # seconds between batches
+    AUTO_TRAFFIC_INTERVAL = int(os.environ.get('AUTO_TRAFFIC_INTERVAL', '5'))
     AUTO_TRAFFIC_QUERIES_PER_BATCH = int(os.environ.get('AUTO_TRAFFIC_QUERIES_PER_BATCH', '10'))
 
     def get_db_connection():
         return psycopg2.connect(
-            host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
+            host=os.environ.get('POSTGRES_HOST', 'postgres'),
             port=os.environ.get('POSTGRES_PORT', 5432),
-            dbname=os.environ.get('POSTGRES_DB', 'app_db'),
-            user=os.environ.get('POSTGRES_USER', 'postgres'),
-            password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
+            dbname=os.environ.get('POSTGRES_DB', 'demo_app'),
+            user=os.environ.get('POSTGRES_USER', 'app_user'),
+            password=os.environ.get('POSTGRES_PASSWORD', 'app_password')
         )
 
     # ============================================
@@ -290,7 +294,6 @@ data:
             
             for _ in range(AUTO_TRAFFIC_QUERIES_PER_BATCH):
                 query_template = random.choice(QUERY_POOL)
-                # Replace placeholders with random values
                 query = query_template.format(
                     user_id=random.randint(1, 3),
                     order_id=random.randint(1, 4)
@@ -312,9 +315,7 @@ data:
 
     def auto_traffic_loop():
         """Background thread that continuously generates traffic"""
-        print(f"🚀 Auto-traffic generator started (interval: {AUTO_TRAFFIC_INTERVAL}s, queries/batch: {AUTO_TRAFFIC_QUERIES_PER_BATCH})")
-        
-        # Wait for PostgreSQL to be fully ready
+        print(f"Auto-traffic generator started (interval: {AUTO_TRAFFIC_INTERVAL}s, queries/batch: {AUTO_TRAFFIC_QUERIES_PER_BATCH})")
         time.sleep(10)
         
         batch_count = 0
@@ -322,7 +323,7 @@ data:
             success = generate_traffic_batch()
             batch_count += 1
             if success and batch_count % 10 == 0:
-                print(f"📊 Auto-traffic: {batch_count} batches executed ({batch_count * AUTO_TRAFFIC_QUERIES_PER_BATCH} total queries)")
+                print(f"Auto-traffic: {batch_count} batches executed")
             time.sleep(AUTO_TRAFFIC_INTERVAL)
 
     # ============================================
@@ -337,21 +338,11 @@ data:
     def home():
         return jsonify({
             "message": "PostgreSQL DBM Demo App",
-            "auto_traffic": {
-                "enabled": AUTO_TRAFFIC_ENABLED,
-                "interval_seconds": AUTO_TRAFFIC_INTERVAL,
-                "queries_per_batch": AUTO_TRAFFIC_QUERIES_PER_BATCH
-            },
             "endpoints": {
                 "/health": "Health check",
                 "/users": "List all users",
                 "/orders": "List all orders",
-                "/orders/stats": "Order statistics with aggregations",
-                "/generate-traffic": "Manually trigger traffic generation",
-                "/slow-query": "Execute a slow query",
-                "/long-query": "Execute a long query (for truncation test)",
-                "/restricted": "Query restricted schema (permission test)",
-                "/users/<id>/lock-slow": "SELECT FOR UPDATE with delay"
+                "/generate-traffic": "Manually trigger traffic generation"
             }
         })
 
@@ -383,40 +374,6 @@ data:
             for o in orders
         ]})
 
-    @app.route('/orders/stats')
-    def get_order_stats():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT 
-                u.name,
-                COUNT(o.id) as order_count,
-                SUM(o.amount) as total_amount,
-                AVG(o.amount) as avg_amount
-            FROM users u
-            LEFT JOIN orders o ON u.id = o.user_id
-            GROUP BY u.id, u.name
-            HAVING COUNT(o.id) > 0
-            ORDER BY total_amount DESC
-        """)
-        stats = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"stats": [
-            {"user": s[0], "order_count": s[1], "total": float(s[2]), "average": float(s[3])}
-            for s in stats
-        ]})
-
-    @app.route('/slow-query')
-    def slow_query():
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT pg_sleep(0.5), * FROM orders WHERE status IN ('pending', 'shipped')")
-        orders = cur.fetchall()
-        cur.close()
-        conn.close()
-        return jsonify({"message": "Slow query completed", "count": len(orders)})
-
     @app.route('/generate-traffic')
     def generate_traffic():
         """Manually trigger a batch of traffic"""
@@ -426,8 +383,6 @@ data:
             "SELECT COUNT(*) FROM users",
             "SELECT * FROM orders WHERE status = 'completed'",
             "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name",
-            "SELECT * FROM orders WHERE amount > 100 ORDER BY amount DESC",
-            "SELECT DISTINCT status FROM orders",
         ]
         results = []
         for q in queries:
@@ -437,90 +392,12 @@ data:
         conn.close()
         return jsonify({"executed_queries": len(queries), "results": results})
 
-    @app.route('/restricted')
-    def get_restricted():
-        """
-        Query restricted_schema.secret_table using psycopg3 (extended query protocol).
-        This generates parameterized queries with $1 placeholders.
-        Used to reproduce 'failed_to_explain_with_prepared_statement' error.
-        """
-        try:
-            import psycopg
-            conn = psycopg.connect(
-                host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
-                port=int(os.environ.get('POSTGRES_PORT', 5432)),
-                dbname=os.environ.get('POSTGRES_DB', 'app_db'),
-                user=os.environ.get('POSTGRES_USER', 'postgres'),
-                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
-            )
-            cur = conn.cursor()
-            # Parameterized query - will have $1 placeholder in pg_stat_statements
-            random_id = random.randint(1, 5)
-            cur.execute("SELECT * FROM restricted_schema.secret_table WHERE id = %s", (random_id,))
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-            return jsonify({"restricted_data": [{"id": r[0], "data": r[1]} for r in rows]})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    @app.route('/long-query')
-    def long_query():
-        """
-        Execute a very long query (> 4KB) to reproduce 'query_truncated' error.
-        The query will be truncated in pg_stat_statements if track_activity_query_size is low.
-        """
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # Generate a query longer than 4KB (4096 bytes)
-        # 300 conditions * ~20 chars each = ~6000 chars
-        conditions = ' OR '.join([f"name = 'longquery_test_{i}'" for i in range(300)])
-        query = f"SELECT * FROM users WHERE {conditions}"
-        try:
-            cur.execute(query)
-            rows = cur.fetchall()
-            result = {"query_length": len(query), "rows_returned": len(rows)}
-        except Exception as e:
-            result = {"query_length": len(query), "error": str(e)}
-        cur.close()
-        conn.close()
-        return jsonify(result)
-
-    @app.route('/users/<int:user_id>/lock-slow')
-    def lock_user_slow(user_id):
-        """
-        SELECT FOR UPDATE with pg_sleep(3) - takes 3+ seconds to be caught by explain plan.
-        Used to reproduce 'failed_to_explain_with_prepared_statement' error for Case 5.
-        """
-        try:
-            import psycopg
-            conn = psycopg.connect(
-                host=os.environ.get('POSTGRES_HOST', 'postgres-instance-test'),
-                port=int(os.environ.get('POSTGRES_PORT', 5432)),
-                dbname=os.environ.get('POSTGRES_DB', 'app_db'),
-                user=os.environ.get('POSTGRES_USER', 'postgres'),
-                password=os.environ.get('POSTGRES_PASSWORD', 'datadog123')
-            )
-            cur = conn.cursor()
-            # Slow query with FOR UPDATE - 3 seconds to ensure it's caught
-            cur.execute("SELECT pg_sleep(3), * FROM users WHERE id = %s FOR UPDATE", (user_id,))
-            rows = cur.fetchall()
-            conn.commit()
-            cur.close()
-            conn.close()
-            return jsonify({"locked_user_id": user_id, "duration": "3s"})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
     if __name__ == '__main__':
         print("Starting demo app on port 8080...")
         
-        # Start auto-traffic generator in background thread
         if AUTO_TRAFFIC_ENABLED:
             traffic_thread = threading.Thread(target=auto_traffic_loop, daemon=True)
             traffic_thread.start()
-        else:
-            print("⚠️  Auto-traffic generator is DISABLED. Set AUTO_TRAFFIC_ENABLED=true to enable.")
         
         app.run(host='0.0.0.0', port=8080)
 ---
@@ -533,7 +410,6 @@ metadata:
     app: demo-app
     tags.datadoghq.com/env: sandbox
     tags.datadoghq.com/service: demo-app
-    tags.datadoghq.com/version: "1.0"
 spec:
   replicas: 1
   selector:
@@ -545,9 +421,6 @@ spec:
         app: demo-app
         tags.datadoghq.com/env: sandbox
         tags.datadoghq.com/service: demo-app
-        tags.datadoghq.com/version: "1.0"
-      annotations:
-        ad.datadoghq.com/demo-app.logs: '[{"source":"python","service":"demo-app"}]'
     spec:
       containers:
         - name: demo-app
@@ -555,19 +428,17 @@ spec:
           command: ["/bin/bash", "-c"]
           args:
             - |
-              pip install --quiet psycopg2-binary 'psycopg[binary]' flask
-              echo "Waiting for PostgreSQL..."
-              sleep 5
+              pip install --quiet psycopg2-binary flask
               python /app/main.py
           ports:
             - containerPort: 8080
           env:
             - name: POSTGRES_HOST
-              value: "postgres-instance-test"
+              value: "postgres"
             - name: POSTGRES_PORT
               value: "5432"
             - name: POSTGRES_DB
-              value: "app_db"
+              value: "demo_app"
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -578,7 +449,6 @@ spec:
                 secretKeyRef:
                   name: postgres-secrets
                   key: APP_PASSWORD
-            # Auto-traffic configuration
             - name: AUTO_TRAFFIC_ENABLED
               value: "true"
             - name: AUTO_TRAFFIC_INTERVAL
@@ -639,6 +509,12 @@ kubectl apply -f postgres/postgres-deployment.yaml
 
 # Wait for PostgreSQL to be ready
 kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeout=120s
+
+# Deploy the demo app (auto-traffic generator)
+kubectl apply -f app/demo-app.yaml
+
+# Wait for demo app to be ready
+kubectl wait --for=condition=ready pod -l app=demo-app -n postgres-demo --timeout=120s
 
 # Deploy Datadog Agent
 kubectl create namespace datadog
@@ -724,13 +600,6 @@ SELECT datadog.explain_statement('SELECT * FROM users WHERE id = 1');
 **Traffic Generation:**
 
 Queries are generated automatically by the auto-traffic generator. No manual action needed.
-
-Alternatively, you can generate traffic manually via curl:
-
-```bash
-kubectl port-forward -n postgres-demo svc/demo-app 8080:8080 &
-curl http://localhost:8080/generate-traffic
-```
 
 ---
 
@@ -1079,6 +948,7 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ---
 
 ## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
+![Case 5 - SELECT ... FOR UPDATE Requires UPDATE Privilege](case5.png)
 
 **UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
 

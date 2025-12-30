@@ -173,9 +173,13 @@ spec:
                 "password": "datadog_password",
                 "dbname": "demo_app",
                 "dbm": true,
-                "query_samples": {"enabled": true},
-                "query_metrics": {"enabled": true},
-                "collect_settings": {"enabled": true}
+                "query_samples": {
+                  "enabled": true,
+                  "collection_interval": 1,
+                  "explained_queries_per_hour_per_query": 600,
+                  "samples_per_hour_per_query": 300,
+                  "explain_parameterized_queries": true
+                }
               }]
             }
           }
@@ -524,6 +528,37 @@ helm upgrade --install datadog-agent datadog/datadog -n datadog -f datadog/value
 
 ---
 
+## DBM Configuration Reference
+
+The postgres check annotation supports extensive configuration for Database Monitoring. The annotation in `postgres-deployment.yaml` includes all `query_samples` options:
+
+### query_samples Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable collection of explain plans. Requires `dbm: true`. |
+| `collection_interval` | number | `1` | Explain plan collection interval (in seconds). Each collection involves a single query to `pg_stat_activity` followed by at most one `EXPLAIN` query per unique normalized query. |
+| `explain_function` | string | `datadog.explain_statement` | Override the default function used to collect explain plans for queries. |
+| `explained_queries_per_hour_per_query` | integer | `60` | Rate limit for how many explain plans will be collected per hour per normalized query. |
+| `samples_per_hour_per_query` | integer | `15` | Rate limit for how many explain plan events will be ingested per hour per normalized explain plan. |
+| `explained_queries_cache_maxsize` | integer | `5000` | Max size of the cache used for the `explained_queries_per_hour_per_query` rate limit. Increase for databases with many unique normalized queries. |
+| `seen_samples_cache_maxsize` | integer | `10000` | Max size of the cache used for the `samples_per_hour_per_query` rate limit. Increase for databases with many unique normalized explain plans. |
+| `explain_parameterized_queries` | boolean | `true` | Enable the ability to explain parameterized queries (useful for extended query protocol or prepared statements). |
+
+### query_metrics Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable collection of query metrics from `pg_stat_statements`. |
+
+### collect_settings Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable collection of PostgreSQL settings/configuration. |
+
+---
+
 ## Auto Traffic Generator
 
 The demo app includes an **automatic traffic generator** that runs in the background, continuously executing queries against PostgreSQL. This ensures explain plans are collected without needing to manually run curl commands.
@@ -860,6 +895,7 @@ kubectl wait --for=condition=ready pod -l app=postgres -n postgres-demo --timeou
 ---
 
 ## Case 4: Configuration Error (`database_error`)
+![Case 4 - Configuration Error (`database_error`)](case4.png)
 
 **UI Message:** "Unable to collect explain plan (configuration error)"
 
@@ -948,7 +984,7 @@ GRANT EXECUTE ON FUNCTION datadog.explain_statement(TEXT) TO datadog;
 ---
 
 ## Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege
-![Case 5 - SELECT ... FOR UPDATE Requires UPDATE Privilege](case5.png)
+![Case 5: SELECT ... FOR UPDATE Requires UPDATE Privilege](case5.png)
 
 **UI Message:** "Datadog agent user lacks permission" (`failed_to_explain_with_prepared_statement`)
 
